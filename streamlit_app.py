@@ -215,7 +215,6 @@ dl.insert(1, "daypart", sel_dp)
 st.download_button("Download Top-K hexes (CSV)", dl.to_csv(index=False).encode("utf-8"),
                    file_name=f"topk_{sel_date.date()}_{sel_dp.replace(':','-')}.csv")
 
-
 # ---------- MAP ----------
 use_folium = st.toggle("Use Folium map (fallback)", value=False)
 
@@ -224,31 +223,33 @@ try:
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        # Ensure numeric & normalize safely (no .ptp())
+        # Ensure numeric and normalize safely (no .ptp())
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
-        rmin, rmax = float(joined["risk"].min()), float(joined["risk"].max())
+        rmin = float(joined["risk"].min())
+        rmax = float(joined["risk"].max())
         denom = (rmax - rmin) if (rmax > rmin) else 1.0
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
 
-        # Precompute RGBA in Python (no JS/math in the spec)
-        joined["fill_a"] = (80 + (joined["risk_norm"] * 175)).clip(0, 255).round().astype(int)
-        joined["fill_rgba"] = joined.apply(
-            lambda r: [255, 120, 0, int(r["fill_a"])], axis=1
-        )
+        # Precompute RGBA in Python (deck.gl JSON can't call functions)
+        # Orange fill, alpha from 110..240 based on risk_norm
+        alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
+        joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
+
+        # Map center
+        u = union_all_safe(joined.geometry)
+        center = [float(u.centroid.y), float(u.centroid.x)]
 
         if not use_folium:
-            # PyDeck / deck.gl
+            # PyDeck (WebGL)
             layer = pdk.Layer(
                 "GeoJsonLayer",
                 data=joined.to_json(),
-                # IMPORTANT: refer to a column, not an inline expression
-                get_fill_color="properties.fill_rgba",
-                get_line_color=[0, 0, 0, 160],
+                get_fill_color="properties.fill_rgba",   # <-- read from column
+                get_line_color=[0, 0, 0, 180],
+                get_line_width=1,
                 line_width_min_pixels=1,
                 pickable=True,
             )
-            u = union_all_safe(joined.geometry)
-            center = [float(u.centroid.y), float(u.centroid.x)]
             st.pydeck_chart(
                 pdk.Deck(
                     layers=[layer],
@@ -260,13 +261,17 @@ try:
         else:
             # Folium fallback (no WebGL)
             import folium
-            u = union_all_safe(joined.geometry)
-            center = [float(u.centroid.y), float(u.centroid.x)]
             m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
             folium.GeoJson(
-                joined[["geometry"]].to_json(),
+                joined.to_json(),
                 name="TopK",
-                style_function=lambda x: {"color": "#ff7800", "weight": 1.5, "fillOpacity": 0.35},
+                style_function=lambda feat: {
+                    "color": "#ff8800",
+                    "weight": 1.5,
+                    # fill opacity tied to risk_norm (0.3..1.0)
+                    "fillOpacity": float(feat["properties"].get("risk_norm", 0)) * 0.7 + 0.3,
+                },
+                highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
             ).add_to(m)
             from streamlit.components.v1 import html
             html(m._repr_html_(), height=520)
@@ -274,6 +279,7 @@ try:
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+
 
 
 # ---------- SECTORS ----------
