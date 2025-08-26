@@ -223,43 +223,47 @@ try:
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        # Ensure numeric and normalize safely (no .ptp())
+        # ensure numeric + normalize
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
-        rmin = float(joined["risk"].min())
-        rmax = float(joined["risk"].max())
+        rmin, rmax = float(joined["risk"].min()), float(joined["risk"].max())
         denom = (rmax - rmin) if (rmax > rmin) else 1.0
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
 
-        # Precompute RGBA in Python (deck.gl JSON can't call functions)
-        # Orange fill, alpha from 110..240 based on risk_norm
+        # precompute color in Python (no JS in deck.gl accessors)
         alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
         joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
 
-        # Map center
+        # map center
         u = union_all_safe(joined.geometry)
         center = [float(u.centroid.y), float(u.centroid.x)]
 
         if not use_folium:
-            # PyDeck (WebGL)
+            import json
+            geojson_dict = json.loads(joined.to_json())   # pass a dict, not a string
+
             layer = pdk.Layer(
                 "GeoJsonLayer",
-                data=joined.to_json(),
-                get_fill_color="properties.fill_rgba",   # <-- read from column
+                data=geojson_dict,
+                filled=True,                # make sure polygons are filled
+                stroked=True,
+                opacity=0.7,
+                get_fill_color="properties.fill_rgba",  # read from properties
                 get_line_color=[0, 0, 0, 180],
-                get_line_width=1,
                 line_width_min_pixels=1,
                 pickable=True,
             )
+
             st.pydeck_chart(
                 pdk.Deck(
                     layers=[layer],
                     initial_view_state=pdk.ViewState(
                         latitude=center[0], longitude=center[1], zoom=13
                     ),
+                    # If you have MAPBOX_API_KEY in secrets, deck will use it automatically.
+                    # map_style="mapbox://styles/mapbox/light-v10",   # optional if you prefer light
                 )
             )
         else:
-            # Folium fallback (no WebGL)
             import folium
             m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
             folium.GeoJson(
@@ -268,7 +272,6 @@ try:
                 style_function=lambda feat: {
                     "color": "#ff8800",
                     "weight": 1.5,
-                    # fill opacity tied to risk_norm (0.3..1.0)
                     "fillOpacity": float(feat["properties"].get("risk_norm", 0)) * 0.7 + 0.3,
                 },
                 highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
@@ -279,6 +282,7 @@ try:
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+
 
 # ---------- VIGILANCE BY DAYPART (month summary) ----------
 st.subheader("Vigilance by daypart (month summary)")
