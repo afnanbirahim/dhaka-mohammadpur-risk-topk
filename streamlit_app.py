@@ -215,6 +215,7 @@ dl.insert(1, "daypart", sel_dp)
 st.download_button("Download Top-K hexes (CSV)", dl.to_csv(index=False).encode("utf-8"),
                    file_name=f"topk_{sel_date.date()}_{sel_dp.replace(':','-')}.csv")
 
+
 # ---------- MAP ----------
 use_folium = st.toggle("Use Folium map (fallback)", value=False)
 
@@ -223,18 +224,25 @@ try:
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        # Ensure numeric and normalize WITHOUT .ptp()
+        # Ensure numeric & normalize safely (no .ptp())
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
-        rmin = float(joined["risk"].min())
-        rmax = float(joined["risk"].max())
+        rmin, rmax = float(joined["risk"].min()), float(joined["risk"].max())
         denom = (rmax - rmin) if (rmax > rmin) else 1.0
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
 
+        # Precompute RGBA in Python (no JS/math in the spec)
+        joined["fill_a"] = (80 + (joined["risk_norm"] * 175)).clip(0, 255).round().astype(int)
+        joined["fill_rgba"] = joined.apply(
+            lambda r: [255, 120, 0, int(r["fill_a"])], axis=1
+        )
+
         if not use_folium:
+            # PyDeck / deck.gl
             layer = pdk.Layer(
                 "GeoJsonLayer",
                 data=joined.to_json(),
-                get_fill_color="[255,120,0, 80 + Math.floor(risk_norm * 175)]",
+                # IMPORTANT: refer to a column, not an inline expression
+                get_fill_color="properties.fill_rgba",
                 get_line_color=[0, 0, 0, 160],
                 line_width_min_pixels=1,
                 pickable=True,
@@ -244,10 +252,13 @@ try:
             st.pydeck_chart(
                 pdk.Deck(
                     layers=[layer],
-                    initial_view_state=pdk.ViewState(latitude=center[0], longitude=center[1], zoom=13),
+                    initial_view_state=pdk.ViewState(
+                        latitude=center[0], longitude=center[1], zoom=13
+                    ),
                 )
             )
         else:
+            # Folium fallback (no WebGL)
             import folium
             u = union_all_safe(joined.geometry)
             center = [float(u.centroid.y), float(u.centroid.x)]
@@ -255,10 +266,11 @@ try:
             folium.GeoJson(
                 joined[["geometry"]].to_json(),
                 name="TopK",
-                style_function=lambda x: {"color":"#ff7800","weight":1.5,"fillOpacity":0.35},
+                style_function=lambda x: {"color": "#ff7800", "weight": 1.5, "fillOpacity": 0.35},
             ).add_to(m)
             from streamlit.components.v1 import html
             html(m._repr_html_(), height=520)
+
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
