@@ -223,7 +223,7 @@ try:
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        # make sure risk is float and normalize safely
+        # Ensure numeric and normalize WITHOUT .ptp()
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
         rmin = float(joined["risk"].min())
         rmax = float(joined["risk"].max())
@@ -231,7 +231,6 @@ try:
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
 
         if not use_folium:
-            # PyDeck (WebGL) renderer
             layer = pdk.Layer(
                 "GeoJsonLayer",
                 data=joined.to_json(),
@@ -249,7 +248,6 @@ try:
                 )
             )
         else:
-            # Folium fallback (no WebGL)
             import folium
             u = union_all_safe(joined.geometry)
             center = [float(u.centroid.y), float(u.centroid.x)]
@@ -257,11 +255,10 @@ try:
             folium.GeoJson(
                 joined[["geometry"]].to_json(),
                 name="TopK",
-                style_function=lambda x: {"color": "#ff7800", "weight": 1.5, "fillOpacity": 0.35},
+                style_function=lambda x: {"color":"#ff7800","weight":1.5,"fillOpacity":0.35},
             ).add_to(m)
             from streamlit.components.v1 import html
             html(m._repr_html_(), height=520)
-
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
