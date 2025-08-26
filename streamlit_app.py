@@ -216,27 +216,40 @@ st.download_button("Download Top-K hexes (CSV)", dl.to_csv(index=False).encode("
                    file_name=f"topk_{sel_date.date()}_{sel_dp.replace(':','-')}.csv")
 
 # ---------- MAP ----------
+use_folium = st.toggle("Use Folium map (fallback)", value=False)
+
 try:
     joined = grid.merge(top, on="h3", how="inner")
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        use_folium = st.toggle("Use Folium map (fallback)", value=False)
+        # make sure risk is float and normalize safely
+        joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
+        rmin = float(joined["risk"].min())
+        rmax = float(joined["risk"].max())
+        denom = (rmax - rmin) if (rmax > rmin) else 1.0
+        joined["risk_norm"] = (joined["risk"] - rmin) / denom
+
         if not use_folium:
-            joined["risk_norm"] = (joined["risk"] - joined["risk"].min()) / (joined["risk"].ptp() + 1e-9)
+            # PyDeck (WebGL) renderer
             layer = pdk.Layer(
                 "GeoJsonLayer",
                 data=joined.to_json(),
-                get_fill_color="[255,120,0, 80 + Math.floor(risk_norm*175)]",
+                get_fill_color="[255,120,0, 80 + Math.floor(risk_norm * 175)]",
                 get_line_color=[0, 0, 0, 160],
                 line_width_min_pixels=1,
                 pickable=True,
             )
             u = union_all_safe(joined.geometry)
             center = [float(u.centroid.y), float(u.centroid.x)]
-            st.pydeck_chart(pdk.Deck(layers=[layer],
-                                     initial_view_state=pdk.ViewState(latitude=center[0], longitude=center[1], zoom=13)))
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=pdk.ViewState(latitude=center[0], longitude=center[1], zoom=13),
+                )
+            )
         else:
+            # Folium fallback (no WebGL)
             import folium
             u = union_all_safe(joined.geometry)
             center = [float(u.centroid.y), float(u.centroid.x)]
@@ -248,9 +261,11 @@ try:
             ).add_to(m)
             from streamlit.components.v1 import html
             html(m._repr_html_(), height=520)
+
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+
 
 # ---------- SECTORS ----------
 st.subheader("Patrol sectors")
