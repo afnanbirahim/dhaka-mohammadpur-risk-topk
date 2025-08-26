@@ -284,10 +284,15 @@ except Exception as e:
 # ---------- VIGILANCE BY DAYPART (month summary) ----------
 st.subheader("Vigilance by daypart (month summary)")
 
-# cross-daypart daily budget you want to deploy (across all 4 dayparts)
 daily_budget_min = st.number_input(
     "Total patrol minutes per day (across all dayparts)",
     min_value=60, max_value=1440, value=480, step=30
+)
+
+method = st.radio(
+    "Compute share using",
+    ["Share of **month** total risk", "Average **daily** share"],
+    index=0, horizontal=True
 )
 
 def _month_filter(df, month_str):
@@ -304,41 +309,56 @@ summary = None
 source_note = ""
 
 if os.path.exists(SECT_CSV):
-    # Best source — sector risk per (date, daypart)
+    # Best source: sector risk per (date, daypart)
     sect_all = pd.read_csv(SECT_CSV, parse_dates=["date"])
     sect_m   = _month_filter(sect_all, sel_month)
-
     # risk per (date, daypart)
     dd = sect_m.groupby(["date", "daypart"], as_index=False)["risk_sum"].sum()
 
-    # daily totals across all dayparts
-    dd["daily_total"] = dd.groupby("date")["risk_sum"].transform("sum").replace(0, np.nan)
-    dd["share"]       = dd["risk_sum"] / dd["daily_total"]
-
-    # average share across the month by daypart
-    g = dd.groupby("daypart")["share"].mean().fillna(0.0).sort_values(ascending=False)
+    if method.startswith("Share of"):
+        # Month-level aggregation (no per-day normalization)
+        month_totals = dd.groupby("daypart", as_index=False)["risk_sum"].sum()
+        month_totals = month_totals.rename(columns={"risk_sum": "risk_month_total"})
+        month_totals["share"] = month_totals["risk_month_total"] / month_totals["risk_month_total"].sum()
+        g = month_totals.set_index("daypart")["share"]
+        label = "Share of **month** total risk by daypart"
+    else:
+        # Per-day normalization first, then average share across the month
+        dd["daily_total"] = dd.groupby("date")["risk_sum"].transform("sum").replace(0, np.nan)
+        dd["share"]       = dd["risk_sum"] / dd["daily_total"]
+        g = dd.groupby("daypart")["share"].mean().fillna(0.0)
+        label = "Average **daily** share by daypart (each day sums to 100%)"
 
     rec_minutes = (g * daily_budget_min).round(0).astype(int)
     summary = pd.DataFrame({
         "avg_share_%": (g * 100).round(1),
         "recommended_min_per_day": rec_minutes
-    })
-    source_note = "Source: patrol_sectors.csv (risk-based share across dayparts)"
+    }).sort_values("avg_share_%", ascending=False)
+    source_note = "Source: patrol_sectors.csv"
 
 elif os.path.exists(TOPK_CSV):
-    # Fallback — aggregate Top-K risk per (date, daypart)
+    # Fallback: aggregate Top-K risk per (date, daypart)
     tk = pd.read_csv(TOPK_CSV, parse_dates=["date"])
     tkm = _month_filter(tk, sel_month)
     dd  = tkm.groupby(["date","daypart"], as_index=False)["risk"].sum()
-    dd["daily_total"] = dd.groupby("date")["risk"].transform("sum").replace(0, np.nan)
-    dd["share"]       = dd["risk"] / dd["daily_total"]
-    g = dd.groupby("daypart")["share"].mean().fillna(0.0).sort_values(ascending=False)
+
+    if method.startswith("Share of"):
+        month_totals = dd.groupby("daypart", as_index=False)["risk"].sum()
+        month_totals = month_totals.rename(columns={"risk": "risk_month_total"})
+        month_totals["share"] = month_totals["risk_month_total"] / month_totals["risk_month_total"].sum()
+        g = month_totals.set_index("daypart")["share"]
+        label = "Share of **month** total Top-K risk by daypart"
+    else:
+        dd["daily_total"] = dd.groupby("date")["risk"].transform("sum").replace(0, np.nan)
+        dd["share"]       = dd["risk"] / dd["daily_total"]
+        g = dd.groupby("daypart")["share"].mean().fillna(0.0)
+        label = "Average **daily** share by daypart (Top-K fallback)"
 
     rec_minutes = (g * daily_budget_min).round(0).astype(int)
     summary = pd.DataFrame({
         "avg_share_%": (g * 100).round(1),
         "recommended_min_per_day": rec_minutes
-    })
+    }).sort_values("avg_share_%", ascending=False)
     source_note = "Source: topk_hexes.csv (fallback)"
 
 else:
@@ -346,8 +366,8 @@ else:
 
 if summary is not None:
     st.dataframe(summary.rename_axis("daypart"), use_container_width=True)
-    _plot_bar(summary["recommended_min_per_day"], "Recommended minutes per day by daypart")
-    st.caption(source_note)
+    _plot_bar(summary["recommended_min_per_day"], "Recommended patrol minutes per day by daypart")
+    st.caption(source_note + ". Use this to apportion daily patrol time across dayparts.")
 
 
 
