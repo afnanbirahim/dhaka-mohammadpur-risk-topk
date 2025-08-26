@@ -280,6 +280,70 @@ except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
 
+# ---------- MAP ----------
+use_folium = st.toggle("Use Folium map (fallback)", value=False)
+
+try:
+    joined = grid.merge(top, on="h3", how="inner")
+    if joined.empty:
+        st.info("No Top-K hexes for this selection.")
+    else:
+        # Ensure numeric and normalize safely (no .ptp())
+        joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
+        rmin = float(joined["risk"].min())
+        rmax = float(joined["risk"].max())
+        denom = (rmax - rmin) if (rmax > rmin) else 1.0
+        joined["risk_norm"] = (joined["risk"] - rmin) / denom
+
+        # Precompute RGBA in Python (deck.gl JSON can't call functions)
+        # Orange fill, alpha from 110..240 based on risk_norm
+        alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
+        joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
+
+        # Map center
+        u = union_all_safe(joined.geometry)
+        center = [float(u.centroid.y), float(u.centroid.x)]
+
+        if not use_folium:
+            # PyDeck (WebGL)
+            layer = pdk.Layer(
+                "GeoJsonLayer",
+                data=joined.to_json(),
+                get_fill_color="properties.fill_rgba",   # <-- read from column
+                get_line_color=[0, 0, 0, 180],
+                get_line_width=1,
+                line_width_min_pixels=1,
+                pickable=True,
+            )
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=pdk.ViewState(
+                        latitude=center[0], longitude=center[1], zoom=13
+                    ),
+                )
+            )
+        else:
+            # Folium fallback (no WebGL)
+            import folium
+            m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
+            folium.GeoJson(
+                joined.to_json(),
+                name="TopK",
+                style_function=lambda feat: {
+                    "color": "#ff8800",
+                    "weight": 1.5,
+                    # fill opacity tied to risk_norm (0.3..1.0)
+                    "fillOpacity": float(feat["properties"].get("risk_norm", 0)) * 0.7 + 0.3,
+                },
+                highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
+            ).add_to(m)
+            from streamlit.components.v1 import html
+            html(m._repr_html_(), height=520)
+
+except Exception as e:
+    st.warning(f"Map render failed: {e}")
+    st.dataframe(top.head(20))
 
 
 # ---------- SECTORS ----------
