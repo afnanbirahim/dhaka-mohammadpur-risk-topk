@@ -279,71 +279,78 @@ try:
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+# ---------- VIGILANCE BY DAYPART (month summary) ----------
+st.subheader("Vigilance by daypart (month summary)")
 
-# ---------- MAP ----------
-use_folium = st.toggle("Use Folium map (fallback)", value=False)
+metric_choice = st.radio(
+    "Show by", ["dwell minutes per day", "risk sum per day"], index=0, horizontal=True
+)
 
-try:
-    joined = grid.merge(top, on="h3", how="inner")
-    if joined.empty:
-        st.info("No Top-K hexes for this selection.")
+def _month_filter(df, month_str):
+    return df[df["date"].dt.to_period("M").astype(str) == month_str].copy()
+
+def _safe_bar(series, label):
+    if series.empty:
+        st.info("No data for the selected month.")
+        return
+    st.bar_chart(series.sort_values(ascending=False), height=240)
+    st.caption(label)
+
+summary_df = None
+note = ""
+
+if os.path.exists(SECT_CSV):
+    # Best source: patrol sectors (already merged & weighted)
+    sect_all = pd.read_csv(SECT_CSV, parse_dates=["date"])
+    sect_m   = _month_filter(sect_all, sel_month)
+
+    # per (date, daypart) totals → average per daypart
+    dd = (sect_m.groupby(["date","daypart"], as_index=False)[["dwell_min","risk_sum"]].sum())
+    g  = dd.groupby("daypart", as_index=False).agg(
+            days        = ("date","nunique"),
+            dwell_total = ("dwell_min","sum"),
+            risk_total  = ("risk_sum","sum"),
+        )
+    g["dwell_per_day"] = g["dwell_total"] / g["days"].where(g["days"]>0, 1)
+    g["risk_per_day"]  = g["risk_total"]  / g["days"].where(g["days"]>0, 1)
+
+    if metric_choice.startswith("dwell"):
+        series = g.set_index("daypart")["dwell_per_day"]
+        label  = "Average dwell minutes per day by daypart (this month)"
     else:
-        # Ensure numeric and normalize safely (no .ptp())
-        joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
-        rmin = float(joined["risk"].min())
-        rmax = float(joined["risk"].max())
-        denom = (rmax - rmin) if (rmax > rmin) else 1.0
-        joined["risk_norm"] = (joined["risk"] - rmin) / denom
+        series = g.set_index("daypart")["risk_per_day"]
+        label  = "Average risk sum per day by daypart (this month)"
 
-        # Precompute RGBA in Python (deck.gl JSON can't call functions)
-        # Orange fill, alpha from 110..240 based on risk_norm
-        alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
-        joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
+    pct = 100 * series / series.sum() if series.sum() else series*0
+    summary_df = pd.DataFrame({"avg_per_day": series.round(2), "share_%": pct.round(1)})
+    note = "Source: patrol_sectors.csv"
 
-        # Map center
-        u = union_all_safe(joined.geometry)
-        center = [float(u.centroid.y), float(u.centroid.x)]
+elif os.path.exists(TOPK_CSV):
+    # Fallback: aggregate Top-K hex risk by (date, daypart)
+    tk = pd.read_csv(TOPK_CSV, parse_dates=["date"])
+    tkm = _month_filter(tk, sel_month)
+    dd  = tkm.groupby(["date","daypart"], as_index=False)["risk"].sum()
+    g   = dd.groupby("daypart", as_index=False).agg(
+            days       = ("date","nunique"),
+            risk_total = ("risk","sum"),
+        )
+    g["risk_per_day"] = g["risk_total"] / g["days"].where(g["days"]>0, 1)
+    series = g.set_index("daypart")["risk_per_day"]
+    pct    = 100 * series / series.sum() if series.sum() else series*0
+    summary_df = pd.DataFrame({"avg_per_day": series.round(3), "share_%": pct.round(1)})
+    label = "Average Top-K risk per day by daypart (this month)"
+    note  = "Source: topk_hexes.csv (fallback)"
 
-        if not use_folium:
-            # PyDeck (WebGL)
-            layer = pdk.Layer(
-                "GeoJsonLayer",
-                data=joined.to_json(),
-                get_fill_color="properties.fill_rgba",   # <-- read from column
-                get_line_color=[0, 0, 0, 180],
-                get_line_width=1,
-                line_width_min_pixels=1,
-                pickable=True,
-            )
-            st.pydeck_chart(
-                pdk.Deck(
-                    layers=[layer],
-                    initial_view_state=pdk.ViewState(
-                        latitude=center[0], longitude=center[1], zoom=13
-                    ),
-                )
-            )
-        else:
-            # Folium fallback (no WebGL)
-            import folium
-            m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
-            folium.GeoJson(
-                joined.to_json(),
-                name="TopK",
-                style_function=lambda feat: {
-                    "color": "#ff8800",
-                    "weight": 1.5,
-                    # fill opacity tied to risk_norm (0.3..1.0)
-                    "fillOpacity": float(feat["properties"].get("risk_norm", 0)) * 0.7 + 0.3,
-                },
-                highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
-            ).add_to(m)
-            from streamlit.components.v1 import html
-            html(m._repr_html_(), height=520)
+else:
+    st.info("No sectors or Top-K files found; add ops/patrol_sectors.csv or ops/topk_hexes.csv to enable this summary.")
 
-except Exception as e:
-    st.warning(f"Map render failed: {e}")
-    st.dataframe(top.head(20))
+if summary_df is not None:
+    st.dataframe(
+        summary_df.rename(columns={"avg_per_day":"avg", "share_%":"share %"}),
+        use_container_width=True,
+    )
+    _safe_bar(summary_df["avg_per_day"], label)
+    st.caption(f"Use this to weight patrol hours across dayparts. {note}")
 
 
 # ---------- SECTORS ----------
