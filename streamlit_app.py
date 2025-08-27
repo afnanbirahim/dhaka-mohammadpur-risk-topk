@@ -280,32 +280,70 @@ use_folium = st.toggle("Use Folium map (fallback)", value=False)
 try:
     joined = grid.merge(top, on="h3", how="inner")
     if joined.empty:
-        st.info("No Top-K hexes for this selection.")
+        st.info("No Top-K cells for this selection.")
     else:
-        # numeric + normalize
+        # Ensure numeric + normalize (no .ptp())
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
         rmin, rmax = float(joined["risk"].min()), float(joined["risk"].max())
         denom = (rmax - rmin) if (rmax > rmin) else 1.0
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
-        alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
-        joined["rank"] = joined["risk"].rank(ascending=False, method="min").astype(int)
+        joined = joined.sort_values("risk", ascending=False).reset_index(drop=True)
+        joined["rank"] = joined.index + 1
 
-        # Center
-        u = union_all_safe(joined.geometry)
+        # Precompute color in Python (deck.gl cannot execute JS in JSON)
+        alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
+        joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
+
+        # Only pass serializable props to GeoJSON
+        gj = joined[["h3", "risk", "risk_norm", "rank", "fill_rgba", "geometry"]].copy()
+
+        # Center on data
+        u = union_all_safe(gj.geometry)
         center = [float(u.centroid.y), float(u.centroid.x)]
 
         if not use_folium:
-            # --- your existing pydeck code here (unchanged) ---
-            ...
+            # ---- PYDECK (WebGL) ----
+            import json, pydeck as pdk
+            geojson_dict = json.loads(gj.to_json())  # pass dict, not string
+
+            layer = pdk.Layer(
+                "GeoJsonLayer",
+                data=geojson_dict,
+                filled=True,
+                stroked=True,
+                opacity=0.7,
+                get_fill_color="properties.fill_rgba",  # read from properties
+                get_line_color=[0, 0, 0, 180],
+                line_width_min_pixels=1,
+                pickable=True,
+                auto_highlight=True,
+            )
+
+            tooltip = {
+                "html": "<b>H3:</b> {h3}<br/>"
+                        "<b>Risk score:</b> {risk}<br/>"
+                        "<b>Priority:</b> {rank}",
+                "style": {"backgroundColor": "rgba(0,0,0,0.7)", "color": "white"},
+            }
+
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=pdk.ViewState(latitude=center[0], longitude=center[1], zoom=13),
+                    tooltip=tooltip,
+                )
+            )
+
         else:
-            import folium, json
+            # ---- FOLIUM (click-to-select) ----
+            import json, folium
             from streamlit_folium import st_folium
 
             m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
 
-            # HEX LAYER with properties (so we can capture clicks)
-            hex_gj = folium.GeoJson(
-                json.loads(joined.to_json()),
+            # HEX layer (safe props only)
+            folium.GeoJson(
+                json.loads(gj.to_json()),
                 name="TopK cells",
                 style_function=lambda feat: {
                     "color": "#000000",
@@ -317,78 +355,69 @@ try:
                 tooltip=folium.GeoJsonTooltip(
                     fields=["h3", "risk", "rank"],
                     aliases=["H3", "Risk score", "Priority"],
-                    localize=True, sticky=True
+                    localize=True,
+                    sticky=True,
                 ),
                 popup=folium.GeoJsonPopup(
                     fields=["h3", "risk", "rank"],
                     aliases=["H3", "Risk score", "Priority"],
-                    localize=True
-                )
-            )
-            hex_gj.add_to(m)
+                    localize=True,
+                ),
+            ).add_to(m)
 
-            # Optional: SECTOR polygons (clickable)
+            # Optional: SECTOR polygons (convert date → string to avoid Timestamp JSON error)
             if os.path.exists(SECT_GJ):
                 sect_gdf = gpd.read_file(SECT_GJ).to_crs(4326)
-                # filter to selected date/daypart if columns exist
-                mask = pd.Series([True]*len(sect_gdf))
+                mask = pd.Series([True] * len(sect_gdf))
                 if "daypart" in sect_gdf.columns:
                     mask &= (sect_gdf["daypart"] == sel_dp)
                 if "date" in sect_gdf.columns:
+                    sect_gdf["date_str"] = pd.to_datetime(sect_gdf["date"]).dt.strftime("%Y-%m-%d")
                     mask &= (pd.to_datetime(sect_gdf["date"]).dt.normalize() == sel_date.normalize())
                 sect_today = sect_gdf.loc[mask]
+
                 if not sect_today.empty:
+                    sgj = sect_today[["geometry", "sector_id", "sector_rank", "daypart"]].copy()
+                    # include date as string only if you want to show it
+                    if "date_str" in sect_today.columns:
+                        sgj["date_str"] = sect_today["date_str"]
+
                     folium.GeoJson(
-                        json.loads(sect_today.to_json()),
+                        json.loads(sgj.to_json()),
                         name="Patrol sectors",
-                        style_function=lambda f: {
-                            "color": "#0066CC",
-                            "weight": 2,
-                            "fillOpacity": 0.05,
-                        },
+                        style_function=lambda f: {"color": "#0066CC", "weight": 2, "fillOpacity": 0.05},
                         highlight_function=lambda f: {"weight": 4, "color": "#003366"},
                         tooltip=folium.GeoJsonTooltip(
-                            fields=["sector_id","sector_rank"],
-                            aliases=["Sector","Priority"],
-                            localize=True, sticky=True
+                            fields=[c for c in ["sector_id", "sector_rank", "date_str"] if c in sgj.columns],
+                            aliases=["Sector", "Priority", "Date"][: len([c for c in ["sector_id","sector_rank","date_str"] if c in sgj.columns])],
+                            localize=True,
+                            sticky=True,
                         ),
-                        popup=folium.GeoJsonPopup(
-                            fields=["sector_id","sector_rank"],
-                            aliases=["Sector","Priority"],
-                            localize=True
-                        )
                     ).add_to(m)
 
-            # Render and capture clicks
+            # Render + capture clicks
             out = st_folium(m, height=520, use_container_width=True)
-
-            # Did user click a hex or a sector?
             props = (out or {}).get("last_object_clicked", {}).get("properties", {})
             if props:
-                # 1) If a hex was clicked, set selected hex and rerun
                 if "h3" in props:
                     st.session_state["sel_hex"] = str(props["h3"])
                     st.rerun()
-                # 2) If a sector was clicked, optionally set sel_hex to the top-ranked hex inside
-                elif "sector_id" in props:
-                    sid = str(props["sector_id"])
-                    # pick highest-risk hex inside this sector (best effort)
-                    if os.path.exists(SECT_GJ):
-                        # slow but fine: geometric test on today's cells
-                        hit_sec = sect_today.loc[sect_today["sector_id"] == sid]
-                        if not hit_sec.empty:
-                            poly = hit_sec.geometry.iloc[0]
-                            # pick a hex whose centroid falls in the sector polygon
-                            joined["__c"] = joined.geometry.centroid
-                            inside = joined.loc[joined["__c"].within(poly)]
-                            if not inside.empty:
-                                best = inside.sort_values("risk", ascending=False).iloc[0]
-                                st.session_state["sel_hex"] = str(best["h3"])
-                                st.rerun()
+                elif "sector_id" in props and os.path.exists(SECT_GJ):
+                    # pick top-risk hex inside this sector today
+                    hit = sect_today.loc[sect_today["sector_id"] == str(props["sector_id"])]
+                    if not hit.empty:
+                        poly = hit.geometry.iloc[0]
+                        gj["__c"] = gj.geometry.centroid
+                        inside = gj.loc[gj["__c"].within(poly)]
+                        if not inside.empty:
+                            best = inside.sort_values("risk", ascending=False).iloc[0]
+                            st.session_state["sel_hex"] = str(best["h3"])
+                            st.rerun()
 
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+
 
 
 
