@@ -7,6 +7,29 @@ from shapely.ops import unary_union
 from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is provided
 import numpy as np
 
+# Sectors for a specific day + daypart (merge polygons with CSV attributes)
+def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str):
+    if not (os.path.exists(SECT_GJ) and os.path.exists(SECT_CSV)):
+        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+    try:
+        g = gpd.read_file(SECT_GJ).to_crs(4326)         # polygons (has sector_id)
+    except Exception:
+        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+
+    a = pd.read_csv(SECT_CSV, parse_dates=["date"])     # attributes (sector_id, sector_rank, daypart, date)
+    a["date"] = a["date"].dt.normalize()
+    day = pd.to_datetime(sel_date).normalize()
+    a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp)]
+    if a_today.empty:
+        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+
+    # keep only sectors for this day & daypart
+    g = g.merge(a_today[["sector_id","sector_rank","daypart","date"]], on="sector_id", how="inner")
+    g["date"] = pd.to_datetime(g["date"]).dt.normalize()
+    g = g[(g["daypart"] == sel_dp) & (g["date"] == day)]
+    return g
+
+
 # Build friendly labels for the hex dropdown (e.g., "S1 • risk 0.873 • 618065…1039")
 def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=None):
     """
@@ -451,22 +474,22 @@ try:
                 if "date" in sect_gdf.columns:
                     sect_gdf["date_str"] = pd.to_datetime(sect_gdf["date"]).dt.strftime("%Y-%m-%d")
                     mask &= (pd.to_datetime(sect_gdf["date"]).dt.normalize() == sel_date.normalize())
-                sect_today = sect_gdf.loc[mask]
+                    
+                sect_today = load_sectors_for_day(sel_date, sel_dp)
                 if not sect_today.empty:
-                    sgj = sect_today[["geometry","sector_id","sector_rank","daypart"]].copy()
-                    if "date_str" in sect_today.columns:
-                        sgj["date_str"] = sect_today["date_str"]
+                    sgj = sect_today[["geometry","sector_id","sector_rank","daypart","date"]].copy()
+                    sgj["date_str"] = pd.to_datetime(sgj["date"]).dt.strftime("%Y-%m-%d")  # JSON-safe
                     folium.GeoJson(
-                        json.loads(sgj.to_json()),
+                        json.loads(sgj.drop(columns=["date"]).to_json()),
                         name="Patrol sectors",
                         style_function=lambda f: {"color":"#0066CC","weight":2,"fillOpacity":0.05},
                         highlight_function=lambda f: {"weight":4,"color":"#003366"},
                         tooltip=folium.GeoJsonTooltip(
-                            fields=[c for c in ["sector_id","sector_rank","date_str"] if c in sgj.columns],
-                            aliases=["Sector","Priority","Date"][: len([c for c in ["sector_id","sector_rank","date_str"] if c in sgj.columns])],
-                            localize=True, sticky=True
+                            fields=["sector_id","sector_rank","date_str","daypart"],
+                            aliases=["Sector","Priority","Date","Time"], localize=True, sticky=True
                         ),
                     ).add_to(m)
+
 
             out = st_folium(m, height=520, use_container_width=True)
             props = (out or {}).get("last_object_clicked", {}).get("properties", {})
@@ -638,28 +661,15 @@ else:
 st.subheader("Why here?")
 
 # Build options tied to session state (so map clicks update dropdown)
-# sectors for today/time (for labeling only; safe if file missing)
-# sectors for today/time (for labeling only)
-sect_today = None
-if os.path.exists(SECT_GJ):
-    try:
-        sg = gpd.read_file(SECT_GJ).to_crs(4326)
-        mask = pd.Series(True, index=sg.index)
-        if "daypart" in sg.columns:
-            mask &= (sg["daypart"] == sel_dp)
-        if "date" in sg.columns:
-            mask &= (pd.to_datetime(sg["date"]).dt.normalize() == sel_date.normalize())
-        sect_today = sg.loc[mask].copy()
-    except Exception:
-        sect_today = None
+# sectors for *this date & daypart* (for labeling only)
+sect_today = load_sectors_for_day(sel_date, sel_dp)
 
-options = top["h3"].astype(str).tolist()
+# friendly labels for today's Top-K hexes
+options    = top["h3"].astype(str).tolist()
 labels_map = build_hex_dropdown_labels(options, top, grid, sect_today)
 
-if st.session_state.get("sel_hex") in options:
-    default_idx = options.index(st.session_state["sel_hex"])
-else:
-    default_idx = 0
+# default to last clicked hex
+default_idx = options.index(st.session_state["sel_hex"]) if st.session_state.get("sel_hex") in options else 0
 
 sel_hex = st.selectbox(
     "Inspect grid cell (H3)",
@@ -670,6 +680,7 @@ sel_hex = st.selectbox(
 )
 st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
+
 
 
 
