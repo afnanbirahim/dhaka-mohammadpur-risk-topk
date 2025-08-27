@@ -15,32 +15,36 @@ def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=N
     grid_gdf: GeoDataFrame with columns ["h3","geometry"] (crs=4326)
     sect_today_gdf: optional GeoDataFrame of sectors for the selected date/daypart
     """
-    # risk for the options we are showing
+    import pandas as pd
+    import numpy as np
+
+    # risk & rank for the options we are showing
     d = pd.DataFrame({"h3": pd.Series(hex_list, dtype=str)})
     r = df_with_risk[["h3","risk"]].copy()
     r["h3"] = r["h3"].astype(str)
     d = d.merge(r, on="h3", how="left").sort_values("risk", ascending=False).reset_index(drop=True)
     d["rank"] = d.index + 1
 
-    # optional: sector membership (centroid within polygon)
+    # optional: sector membership (robust)
     d["sector_rank"] = None
     if sect_today_gdf is not None and not sect_today_gdf.empty:
         sectors = sect_today_gdf.to_crs(4326)
         gidx = grid_gdf.set_index("h3")["geometry"]
         for i, row in d.iterrows():
-            try:
-                geom = gidx.loc[str(row["h3"])]
-            except KeyError:
+            h = str(row["h3"])
+            if h not in gidx.index:
                 continue
-            pt = geom.centroid
-            hit = sectors[sectors.contains(pt)]
+            # representative_point() is guaranteed inside polygon
+            pt = gidx.loc[h].representative_point()
+            # 'intersects' will also match boundary cases
+            hit = sectors[sectors.intersects(pt)]
             if not hit.empty:
                 try:
                     d.at[i, "sector_rank"] = int(hit.iloc[0].get("sector_rank"))
                 except Exception:
                     d.at[i, "sector_rank"] = None
 
-    def trunc(h): 
+    def trunc(h):
         h = str(h)
         return h if len(h) <= 10 else f"{h[:6]}…{h[-4:]}"
     def make_label(r):
@@ -49,7 +53,6 @@ def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=N
         return f"{s} • risk {risk} • {trunc(r['h3'])}"
 
     return {str(r["h3"]): make_label(r) for _, r in d.iterrows()}
-
 
 
 def allocate_dwell_minutes(
@@ -636,6 +639,7 @@ st.subheader("Why here?")
 
 # Build options tied to session state (so map clicks update dropdown)
 # sectors for today/time (for labeling only; safe if file missing)
+# sectors for today/time (for labeling only)
 sect_today = None
 if os.path.exists(SECT_GJ):
     try:
@@ -649,17 +653,14 @@ if os.path.exists(SECT_GJ):
     except Exception:
         sect_today = None
 
-# friendly labels for the Top-K hexes shown today
 options = top["h3"].astype(str).tolist()
 labels_map = build_hex_dropdown_labels(options, top, grid, sect_today)
 
-# default to last clicked hex if exists
 if st.session_state.get("sel_hex") in options:
     default_idx = options.index(st.session_state["sel_hex"])
 else:
     default_idx = 0
 
-# human-friendly dropdown: "S1 • risk 0.873 • 618065…1039"
 sel_hex = st.selectbox(
     "Inspect grid cell (H3)",
     options=options,
@@ -667,7 +668,9 @@ sel_hex = st.selectbox(
     format_func=lambda x: labels_map.get(str(x), str(x)),
     key="sel_hex_widget"
 )
+st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
+
 
 
 
@@ -768,6 +771,25 @@ if sel_hex:
             st.dataframe(df_nice, use_container_width=True)
         else:
             st.info("No interpretable features to display.")
+
+    with st.expander("How to read this table"):
+    st.markdown("""
+**Feature** – the signal the model uses for this grid cell.  
+**Value** – this cell’s current value for that signal (rounded).  
+**Group** – which family the signal belongs to:
+
+- **Recent history**: short-term activity near here (e.g., incident flags `3/7/28` days ago, “nearby incidents in last 7 days”, “recent 7-day activity”).  
+  Higher recent activity ⇒ **higher risk**.
+
+- **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).  
+  More relevant places nearby ⇒ can **raise risk** (crowding, exposure).
+
+- **Distances**: how far to the nearest place (**“Distance to Primary road (m)”**, etc.).  
+  Smaller distance ⇒ **closer context**, often **higher risk**.
+
+- **Other**: helpful flags like **“Same time last week”**.
+""")
+
 
     # Optional: SHAP drivers (advanced)
     show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
