@@ -139,6 +139,7 @@ def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFram
     if not (os.path.exists(SECT_GJ) and os.path.exists(SECT_CSV)):
         return empty
 
+    # polygons
     try:
         g = gpd.read_file(SECT_GJ).to_crs(4326)
     except Exception:
@@ -149,30 +150,47 @@ def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFram
         else:
             return empty
 
+    # attributes (the CSV has date/daypart)
     try:
         a = pd.read_csv(SECT_CSV, parse_dates=["date"])
     except Exception:
         return empty
     a["date"] = pd.to_datetime(a["date"], errors="coerce").dt.normalize()
+
     day = pd.to_datetime(sel_date).normalize()
     a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp)][
-        ["sector_id","sector_rank","daypart","date"]
+        ["sector_id", "sector_rank", "daypart", "date"]
     ].copy()
     if a_today.empty:
         return empty
 
+    # join polygons ↔ attributes for this day+time
     gj = g.merge(a_today, on="sector_id", how="inner")
-    if "date" in gj.columns:
-        gj["date"] = pd.to_datetime(gj["date"], errors="coerce").dt.normalize()
-    mask = (gj.get("daypart") == sel_dp) & (gj.get("date") == day)
-    gj = gj.loc[mask]
     if gj.empty:
         return empty
-    keep = ["sector_id","sector_rank","daypart","date","geometry"]
+
+    # normalize date column just in case
+    if "date" in gj.columns:
+        gj["date"] = pd.to_datetime(gj["date"], errors="coerce").dt.normalize()
+
+    # ---- SAFE BOOLEAN MASK (aligned to gj.index) ----
+    m = np.ones(len(gj), dtype=bool)
+    if "daypart" in gj.columns:
+        m &= (gj["daypart"].astype(str).values == str(sel_dp))
+    if "date" in gj.columns:
+        m &= (pd.to_datetime(gj["date"], errors="coerce").dt.normalize().values
+              == day.to_datetime64())
+
+    gj = gj.loc[m]
+    if gj.empty:
+        return empty
+
+    keep = ["sector_id", "sector_rank", "daypart", "date", "geometry"]
     for c in keep:
         if c not in gj.columns:
             gj[c] = pd.NA
     return gj[keep].copy().set_crs(4326)
+
 
 # ---------- BUNDLE (env/secret/local zip) ----------
 def _extract_local_zip_if_present() -> str | None:
