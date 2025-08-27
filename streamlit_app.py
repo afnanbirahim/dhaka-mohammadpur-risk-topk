@@ -223,35 +223,48 @@ try:
     if joined.empty:
         st.info("No Top-K hexes for this selection.")
     else:
-        # ensure numeric + normalize
+        # Ensure numeric & normalize
         joined["risk"] = pd.to_numeric(joined["risk"], errors="coerce").fillna(0.0)
         rmin, rmax = float(joined["risk"].min()), float(joined["risk"].max())
         denom = (rmax - rmin) if (rmax > rmin) else 1.0
         joined["risk_norm"] = (joined["risk"] - rmin) / denom
 
-        # precompute color in Python (no JS in deck.gl accessors)
+        # Rank (1 = highest risk for this day/daypart)
+        joined = joined.sort_values("risk", ascending=False).reset_index(drop=True)
+        joined["rank"] = joined.index + 1
+
+        # Precompute color in Python (no JS in deck.gl accessors)
         alpha = (110 + (joined["risk_norm"] * 130)).round().astype(int).clip(0, 255)
         joined["fill_rgba"] = [[255, 136, 0, int(a)] for a in alpha]
 
-        # map center
+        # Map center
         u = union_all_safe(joined.geometry)
         center = [float(u.centroid.y), float(u.centroid.x)]
 
         if not use_folium:
-            import json
-            geojson_dict = json.loads(joined.to_json())   # pass a dict, not a string
+            import json, pydeck as pdk
+            geojson_dict = json.loads(joined.to_json())  # pass dict, not string
 
             layer = pdk.Layer(
                 "GeoJsonLayer",
                 data=geojson_dict,
-                filled=True,                # make sure polygons are filled
+                filled=True,
                 stroked=True,
                 opacity=0.7,
-                get_fill_color="properties.fill_rgba",  # read from properties
+                get_fill_color="properties.fill_rgba",   # reads from properties
                 get_line_color=[0, 0, 0, 180],
                 line_width_min_pixels=1,
                 pickable=True,
+                auto_highlight=True,
             )
+
+            # Tooltip shows exact H3 id + risk + rank
+            tooltip = {
+                "html": "<b>H3:</b> {h3}<br/>"
+                        "<b>Risk:</b> {risk}<br/>"
+                        "<b>Rank:</b> {rank}",
+                "style": {"backgroundColor": "rgba(0,0,0,0.7)", "color": "white"}
+            }
 
             st.pydeck_chart(
                 pdk.Deck(
@@ -259,29 +272,43 @@ try:
                     initial_view_state=pdk.ViewState(
                         latitude=center[0], longitude=center[1], zoom=13
                     ),
-                    # If you have MAPBOX_API_KEY in secrets, deck will use it automatically.
-                    # map_style="mapbox://styles/mapbox/light-v10",   # optional if you prefer light
+                    tooltip=tooltip,
                 )
             )
         else:
             import folium
+            from streamlit.components.v1 import html
             m = folium.Map(location=center, zoom_start=13, tiles="cartodbpositron")
+
+            # Tooltip + popup with H3 id, risk, rank
             folium.GeoJson(
                 joined.to_json(),
                 name="TopK",
                 style_function=lambda feat: {
                     "color": "#ff8800",
                     "weight": 1.5,
-                    "fillOpacity": float(feat["properties"].get("risk_norm", 0)) * 0.7 + 0.3,
+                    "fillOpacity": float(feat["properties"].get("risk_norm", 0))*0.7 + 0.3,
                 },
                 highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
+                tooltip=folium.GeoJsonTooltip(
+                    fields=["h3", "risk", "rank"],
+                    aliases=["H3", "Risk", "Rank"],
+                    localize=True,
+                    sticky=True
+                ),
+                popup=folium.GeoJsonPopup(
+                    fields=["h3", "risk", "rank"],
+                    aliases=["H3", "Risk", "Rank"],
+                    localize=True
+                )
             ).add_to(m)
-            from streamlit.components.v1 import html
+
             html(m._repr_html_(), height=520)
 
 except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
+
 
 
 # ---------- VIGILANCE BY DAYPART (month summary) ----------
