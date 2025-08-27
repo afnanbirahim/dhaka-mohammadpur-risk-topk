@@ -8,27 +8,72 @@ from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is p
 import numpy as np
 
 # Sectors for a specific day + daypart (merge polygons with CSV attributes)
-def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str):
+def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFrame:
+    """
+    Return ONLY the patrol-sector polygons for the given date + daypart,
+    with columns: sector_id, sector_rank, daypart, date, geometry (crs=4326).
+
+    Reads polygons from SECT_GJ and joins attributes (date/daypart/rank) from SECT_CSV.
+    Handles cases where the GeoJSON has no date/daypart.
+    """
+    # empty, consistent schema
+    empty = gpd.GeoDataFrame(
+        {"sector_id": pd.Series(dtype="string"),
+         "sector_rank": pd.Series(dtype="Int64"),
+         "daypart": pd.Series(dtype="string"),
+         "date": pd.Series(dtype="datetime64[ns]")},
+        geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+        crs="EPSG:4326"
+    )
+
     if not (os.path.exists(SECT_GJ) and os.path.exists(SECT_CSV)):
-        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+        return empty
+
+    # polygons
     try:
-        g = gpd.read_file(SECT_GJ).to_crs(4326)         # polygons (has sector_id)
+        g = gpd.read_file(SECT_GJ).to_crs(4326)
     except Exception:
-        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+        return empty
 
-    a = pd.read_csv(SECT_CSV, parse_dates=["date"])     # attributes (sector_id, sector_rank, daypart, date)
-    a["date"] = a["date"].dt.normalize()
+    # ensure there is a join key
+    if "sector_id" not in g.columns:
+        if "id" in g.columns:
+            g = g.rename(columns={"id": "sector_id"})
+        else:
+            return empty
+
+    # attributes with date/daypart
+    try:
+        a = pd.read_csv(SECT_CSV, parse_dates=["date"])
+    except Exception:
+        return empty
+
+    a["date"] = pd.to_datetime(a["date"], errors="coerce").dt.normalize()
     day = pd.to_datetime(sel_date).normalize()
-    a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp)]
+    a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp)][
+        ["sector_id", "sector_rank", "daypart", "date"]
+    ].copy()
+
     if a_today.empty:
-        return gpd.GeoDataFrame(columns=["sector_id","sector_rank","daypart","date","geometry"], crs="EPSG:4326")
+        return empty
 
-    # keep only sectors for this day & daypart
-    g = g.merge(a_today[["sector_id","sector_rank","daypart","date"]], on="sector_id", how="inner")
-    g["date"] = pd.to_datetime(g["date"]).dt.normalize()
-    g = g[(g["daypart"] == sel_dp) & (g["date"] == day)]
-    return g
+    # join polygons ↔ attributes (adds date/daypart/rank to polygons)
+    gj = g.merge(a_today, on="sector_id", how="inner")
+    if "date" in gj.columns:
+        gj["date"] = pd.to_datetime(gj["date"], errors="coerce").dt.normalize()
 
+    # final filter + column order
+    mask = (gj.get("daypart") == sel_dp) & (gj.get("date") == day)
+    gj = gj.loc[mask]
+
+    if gj.empty:
+        return empty
+
+    keep = ["sector_id", "sector_rank", "daypart", "date", "geometry"]
+    for c in keep:
+        if c not in gj.columns:
+            gj[c] = pd.NA
+    return gj[keep].copy().set_crs(4326)
 
 # Build friendly labels for the hex dropdown (e.g., "S1 • risk 0.873 • 618065…1039")
 def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=None):
@@ -475,21 +520,22 @@ try:
                     sect_gdf["date_str"] = pd.to_datetime(sect_gdf["date"]).dt.strftime("%Y-%m-%d")
                     mask &= (pd.to_datetime(sect_gdf["date"]).dt.normalize() == sel_date.normalize())
                     
-                sect_today = load_sectors_for_day(sel_date, sel_dp)
-                if not sect_today.empty:
-                    sgj = sect_today[["geometry","sector_id","sector_rank","daypart","date"]].copy()
-                    sgj["date_str"] = pd.to_datetime(sgj["date"]).dt.strftime("%Y-%m-%d")  # JSON-safe
-                    folium.GeoJson(
-                        json.loads(sgj.drop(columns=["date"]).to_json()),
-                        name="Patrol sectors",
-                        style_function=lambda f: {"color":"#0066CC","weight":2,"fillOpacity":0.05},
-                        highlight_function=lambda f: {"weight":4,"color":"#003366"},
-                        tooltip=folium.GeoJsonTooltip(
-                            fields=["sector_id","sector_rank","date_str","daypart"],
-                            aliases=["Sector","Priority","Date","Time"], localize=True, sticky=True
-                        ),
-                    ).add_to(m)
-
+# Optional: sectors layer (for this date + daypart only)
+sect_today = load_sectors_for_day(sel_date, sel_dp)
+if not sect_today.empty:
+    sgj = sect_today[["geometry", "sector_id", "sector_rank", "daypart", "date"]].copy()
+    sgj["date_str"] = pd.to_datetime(sgj["date"]).dt.strftime("%Y-%m-%d")  # JSON-safe
+    folium.GeoJson(
+        json.loads(sgj.drop(columns=["date"]).to_json()),
+        name="Patrol sectors",
+        style_function=lambda f: {"color": "#0066CC", "weight": 2, "fillOpacity": 0.05},
+        highlight_function=lambda f: {"weight": 4, "color": "#003366"},
+        tooltip=folium.GeoJsonTooltip(
+            fields=["sector_id", "sector_rank", "date_str", "daypart"],
+            aliases=["Sector", "Priority", "Date", "Time"],
+            localize=True, sticky=True
+        ),
+    ).add_to(m)
 
             out = st_folium(m, height=520, use_container_width=True)
             props = (out or {}).get("last_object_clicked", {}).get("properties", {})
@@ -662,6 +708,7 @@ st.subheader("Why here?")
 
 # Build options tied to session state (so map clicks update dropdown)
 # sectors for *this date & daypart* (for labeling only)
+# sectors for THIS date + daypart (for labeling only)
 sect_today = load_sectors_for_day(sel_date, sel_dp)
 
 # friendly labels for today's Top-K hexes
