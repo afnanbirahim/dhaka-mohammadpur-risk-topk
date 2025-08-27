@@ -375,6 +375,7 @@ if summary is not None:
 
 # ---------- SECTORS ----------
 st.subheader("Patrol sectors")
+
 SECT_OK = os.path.exists(SECT_CSV) and os.path.exists(SECT_GJ)
 if SECT_OK:
     sect = pd.read_csv(SECT_CSV, parse_dates=["date"])
@@ -382,13 +383,34 @@ if SECT_OK:
     if s.empty:
         st.info("No exported sectors for this day/daypart.")
     else:
-        st.dataframe(
-            s[["sector_id", "n_hex", "risk_sum", "area_ha", "dwell_min", "sector_rank"]],
-            use_container_width=True,
+        # Friendly column names for display
+        display_map = {
+            "sector_id": "Sector",
+            "n_hex": "Cells",
+            "risk_sum": "Sector risk",
+            "area_ha": "Area (ha)",
+            "dwell_min": "Suggested minutes",
+            "sector_rank": "Priority",
+        }
+        show_cols = [c for c in display_map.keys() if c in s.columns]
+        s_disp = s[show_cols].rename(columns=display_map)
+
+        st.dataframe(s_disp, use_container_width=True)
+
+        # Offer both downloads: friendly (for briefings) and raw (for analysts)
+        st.download_button(
+            "Download sectors (friendly CSV)",
+            data=s_disp.to_csv(index=False).encode("utf-8"),
+            file_name=f"patrol_sectors_{sel_date.date()}_{sel_dp.replace(':','-')}_friendly.csv",
         )
-        st.download_button("Download sectors (CSV)", data=open(SECT_CSV, "rb"), file_name="patrol_sectors.csv")
+        st.download_button(
+            "Download sectors (raw CSV)",
+            data=open(SECT_CSV, "rb").read(),
+            file_name="patrol_sectors_raw.csv",
+        )
 else:
     st.info("ops/patrol_sectors.* not found (optional).")
+
 
 # ---------- WHY HERE ----------
 st.subheader("Why here?")
