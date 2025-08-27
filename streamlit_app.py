@@ -442,14 +442,120 @@ else:
 
 # ---------- WHY HERE ----------
 st.subheader("Why here?")
-show_shap = st.checkbox("Compute SHAP (slower)", value=False)
+
+import re
+import numpy as np
+
+# Helper: map raw feature names to friendly labels
+def friendly_label(col: str) -> str | None:
+    if col == "ri_norm": return "Recent activity score (0–1)"
+    if col == "neighbor_lag7d": return "Nearby incidents in last 7 days (avg)"
+    if col == "same_daypart_last_week": return "Same time last week (flag)"
+    if col == "days_since_last": return "Days since last incident"
+    if col == "neighbor_dsl_min": return "Days since last in nearby cells (min)"
+
+    m = re.match(r"^dist_(.+)_m$", col)
+    if m:
+        base = m.group(1).replace("_", " ").title()
+        base = (base
+                .replace("Busstops", "Bus stops")
+                .replace("Roads Primary", "Primary road")
+                .replace("Roads Secondary", "Secondary road"))
+        return f"Distance to {base} (m)"
+
+    m = re.match(r"^cnt_(.+)_(\d+)m$", col)
+    if m:
+        what, radius = m.groups()
+        base = what.replace("_", " ").title().replace("Busstops", "Bus stops")
+        return f"{base} within {radius} m (count)"
+
+    m = re.match(r"^lag(\d+)d$", col)
+    if m: return f"Incident {m.group(1)} days ago (flag)"
+
+    m = re.match(r"^past(\d+)_sum$", col)
+    if m: return f"Incidents in past {m.group(1)} days (sum)"
+    m = re.match(r"^past(\d+)_exp$", col)
+    if m: return f"Recent {m.group(1)}-day activity (weighted)"
+
+    return None  # hide unknown/internal
+
+# Helper: format values
+def fmt_value(col: str, val):
+    try:
+        x = float(val)
+    except Exception:
+        return val
+    if col.startswith("dist_") or col.startswith("cnt_") or col.startswith("days_since"):
+        return int(round(x))
+    if re.match(r"^lag\d+d$", col) or col in {"same_daypart_last_week"}:
+        return int(round(x))
+    if col in {"ri_norm"} or col.startswith("past") or col == "neighbor_lag7d":
+        return round(x, 3)
+    return round(x, 3)
+
+# Selected hex
 sel_hex = st.selectbox("Inspect hex (H3)", options=top["h3"].tolist() if len(top) else [])
-st.caption(f"Selected H3: {sel_hex}")  # shows the exact H3 id you’re inspecting
+st.caption(f"Selected H3: {sel_hex}")
+
 if sel_hex:
+    # risk & rank for this hex today (from 'pred' built earlier)
+    risk_series = pred.loc[pred["h3"].astype(str) == sel_hex, "risk"]
+    risk_here = float(risk_series.max()) if not risk_series.empty else np.nan
+    # rank among today's hexes (1 = highest)
+    ranking = (pred.copy()
+                 .assign(_h3=pred["h3"].astype(str))
+                 .sort_values("risk", ascending=False)
+                 .reset_index(drop=True))
+    ranking["rank"] = ranking.index + 1
+    rank_here = int(ranking.loc[ranking["_h3"] == sel_hex, "rank"].min()) if (ranking["_h3"] == sel_hex).any() else None
+
+    # show a short summary line
+    badge = f"Risk score: **{risk_here:.3f}**" if not np.isnan(risk_here) else "Risk score: n/a"
+    if rank_here is not None:
+        badge += f"  |  Priority: **{rank_here}**"
+    st.markdown(badge)
+
+    # row of features for this hex
     row_X = Xsel.loc[rep["h3"].astype(str) == sel_hex]
     if row_X.empty:
         st.info("No feature row for that hex.")
     else:
+        # clean up columns we don't want to show
+        drop_like = [c for c in row_X.columns if c.endswith("_x") or c.endswith("_y") or c.startswith("daypart_")]
+        row = row_X.drop(columns=drop_like, errors="ignore").iloc[0]
+
+        # build friendly table
+        items = []
+        for col, val in row.items():
+            if col in {"date", "h3"}:
+                continue
+            label = friendly_label(col)
+            if not label:
+                continue
+            items.append({"Feature": label, "Value": fmt_value(col, val)})
+
+        import pandas as pd
+        if not items:
+            st.info("No interpretable features to display.")
+        else:
+            # group for readability
+            def _group(name: str):
+                if "Distance" in name: return "Distances"
+                if "within" in name:   return "Counts"
+                if "Recent" in name or "last" in name or "lag" in name: return "Recent history"
+                return "Other"
+
+            df_nice = pd.DataFrame(items)
+            df_nice["Group"] = df_nice["Feature"].map(_group)
+            # order groups: history → counts → distances → other
+            grp_order = {"Recent history": 0, "Counts": 1, "Distances": 2, "Other": 3}
+            df_nice["__ord"] = df_nice["Group"].map(grp_order).fillna(9)
+            df_nice = df_nice.sort_values(["__ord","Feature"]).drop(columns="__ord").reset_index(drop=True)
+
+            st.dataframe(df_nice, use_container_width=True)
+
+        # Optional: SHAP drivers
+        show_shap = st.checkbox("Compute SHAP drivers (slower)", value=False)
         if show_shap:
             try:
                 import shap
@@ -459,18 +565,26 @@ if sel_hex:
                         model_for_shap = pickle.load(f)
                 if model_for_shap is None:
                     model_for_shap = getattr(clf_cal, "base_estimator", None) or getattr(clf_cal, "estimator", None)
+
                 sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
-                if isinstance(sv, list):
+                if isinstance(sv, list):  # LightGBM binary returns [class0, class1]
                     sv = sv[1]
-                vals = sv[0]
-                idx = np.argsort(np.abs(vals))[::-1][:12]
-                contrib = pd.DataFrame({"feature": np.array(feat_cols)[idx], "shap": vals[idx]}).round(5)
-                st.dataframe(contrib, use_container_width=True)
+                contrib = pd.Series(sv[0], index=row_X.columns)
+                contrib = contrib.drop(index=drop_like, errors="ignore")  # same drops as above
+                # map to friendly names & keep top 10 by |impact|
+                top = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s: -np.abs(s)).head(10)
+                if not top.empty:
+                    df_shap = pd.DataFrame({
+                        "Feature": [friendly_label(c) for c in top.index],
+                        "SHAP": [round(float(v), 4) for v in top.values]
+                    })
+                    st.write("Top feature contributions (SHAP):")
+                    st.dataframe(df_shap, use_container_width=True)
+                else:
+                    st.info("SHAP computed, but no interpretable features to show.")
             except Exception as e:
-                st.info(f"SHAP not available ({e}). Showing feature magnitudes.")
-                st.dataframe(row_X.iloc[0].abs().sort_values(ascending=False).head(12).to_frame("value"))
-        else:
-            st.dataframe(row_X.iloc[0].abs().sort_values(ascending=False).head(12).to_frame("value"))
+                st.info(f"SHAP not available ({e}).")
+
 
 # ---------- REPORTS ----------
 st.subheader("Reports")
