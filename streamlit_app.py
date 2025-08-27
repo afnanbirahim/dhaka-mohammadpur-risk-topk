@@ -746,23 +746,26 @@ if sel_hex:
             lab = friendly_label(col)
             if not lab: continue
             items.append({"Feature": lab, "Value": fmt_value(col, val)})
-        if items:
-            df_nice = pd.DataFrame(items)
-            def _grp(name):
-                if "Distance" in name: return "Distances"
-                if "within" in name:   return "Counts"
-                if "Recent" in name or "last" in name or "flag" in name: return "Recent history"
-                return "Other"
-            df_nice["Group"] = df_nice["Feature"].map(_grp)
-            order = {"Recent history":0, "Counts":1, "Distances":2, "Other":3}
-            df_nice["__o"] = df_nice["Group"].map(order).fillna(9)
-            df_nice = df_nice.sort_values(["__o","Feature"]).drop(columns="__o").reset_index(drop=True)
-            st.dataframe(df_nice, use_container_width=True)
-    with st.expander("How to read this table"):
-# (this line should already be in your code)
-st.dataframe(df_nice, use_container_width=True)
+if items:
+    df_nice = pd.DataFrame(items)
 
-HELP_MD = """
+    # group & order for readability
+    def _grp(name):
+        if "Distance" in name: return "Distances"
+        if "within"  in name: return "Counts"
+        if "Recent"  in name or "last" in name or "flag" in name: return "Recent history"
+        return "Other"
+
+    df_nice["Group"] = df_nice["Feature"].map(_grp)
+    order = {"Recent history":0, "Counts":1, "Distances":2, "Other":3}
+    df_nice["__o"] = df_nice["Group"].map(order).fillna(9)
+    df_nice = df_nice.sort_values(["__o","Feature"]).drop(columns="__o").reset_index(drop=True)
+
+    # show the table
+    st.dataframe(df_nice, use_container_width=True)
+
+    # 👇 the help expander MUST be indented under the with-block
+    HELP_MD = """
 **Feature** – the signal the model uses for this grid cell.  
 **Value** – this cell’s current value for that signal (rounded).  
 **Group** – which family the signal belongs to:
@@ -775,31 +778,34 @@ HELP_MD = """
   Smaller distance ⇒ **closer context**, often **higher risk**.
 - **Other**: helpful flags like **“Same time last week (flag)”**.
 """
+    with st.expander("How to read this table"):
+        st.markdown(HELP_MD)
 
-with st.expander("How to read this table"):
-    st.markdown(HELP_MD)
+else:
+    st.info("No interpretable features to display.")
 
+# 🔻 SHAP section stays OUTSIDE the expander and same indent as the table code above
+show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
+if show_shap and not row_X.empty:
+    try:
+        import shap
+        model_for_shap = None
+        if os.path.exists(MODEL_RAW):
+            with open(MODEL_RAW,"rb") as f: model_for_shap = pickle.load(f)
+        if model_for_shap is None:
+            model_for_shap = getattr(clf_cal,"base_estimator",None) or getattr(clf_cal,"estimator",None)
 
+        sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
+        if isinstance(sv, list): sv = sv[1]
+        contrib = pd.Series(sv[0], index=row_X.columns)
+        contrib = contrib.drop(index=drop_like, errors="ignore")
+        top10 = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s:-np.abs(s)).head(10)
+        if not top10.empty:
+            st.write("Top drivers: positive values ↑ increase risk; negative values ↓ reduce risk.")
+            st.dataframe(pd.DataFrame({
+                "Feature": [friendly_label(c) for c in top10.index],
+                "Impact":  [round(float(v),4) for v in top10.values]
+            }), use_container_width=True)
+    except Exception as e:
+        st.info(f"SHAP not available ({e}).")
 
-    show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
-    if show_shap and not row_X.empty:
-        try:
-            import shap
-            model_for_shap = None
-            if os.path.exists(MODEL_RAW):
-                with open(MODEL_RAW,"rb") as f: model_for_shap = pickle.load(f)
-            if model_for_shap is None:
-                model_for_shap = getattr(clf_cal,"base_estimator",None) or getattr(clf_cal,"estimator",None)
-            sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
-            if isinstance(sv, list): sv = sv[1]
-            contrib = pd.Series(sv[0], index=row_X.columns)
-            contrib = contrib.drop(index=drop_like, errors="ignore")
-            top10 = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s:-np.abs(s)).head(10)
-            if not top10.empty:
-                st.write("Top drivers: positive values ↑ increase risk; negative values ↓ reduce risk.")
-                st.dataframe(pd.DataFrame({
-                    "Feature": [friendly_label(c) for c in top10.index],
-                    "Impact": [round(float(v),4) for v in top10.values]
-                }), use_container_width=True)
-        except Exception as e:
-            st.info(f"SHAP not available ({e}).")
