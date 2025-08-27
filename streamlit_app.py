@@ -159,9 +159,28 @@ if not months:
     st.error("No months found.")
     st.stop()
 
+# Month stays the same
 sel_month = st.sidebar.selectbox("Month", options=months, index=len(months)-1)
-TOPK      = st.sidebar.slider("Top-K % (per day, per daypart)", 1, 10, 5)
-risk_mode = st.sidebar.radio("Risk mode", ["pro_only", "blend (0.6/0.4)"], index=0)
+
+# How many places to flag
+TOPK = st.sidebar.slider("Places to cover (%)", 1, 10, 5)
+st.sidebar.caption(
+    "We flag the top **K%** of grid cells for each time-of-day, every day. "
+    "Example: 5% ≈ the riskiest 1 in 20 cells."
+)
+
+# Risk score used
+risk_choice = st.sidebar.radio(
+    "Risk score used",
+    ["Model only (recommended)", "Model + recent activity (60/40)"],
+    index=0
+)
+risk_mode = "pro_only" if risk_choice.startswith("Model only") else "blend"
+st.sidebar.caption(
+    "**Model only** = calibrated probability from the model.  "
+    "**Model + recent** = 60% model + 40% short-term activity."
+)
+
 
 # ---------- LOAD THIS MONTH ----------
 with st.spinner(f"Loading {sel_month}…"):
@@ -600,3 +619,31 @@ with st.expander("Limitations & notes"):
 - Predictions are **area-based**; **no person-level** inference.
 - Use with **local thana logs** and professional judgment.
 """)
+
+# ---------- HR@K SWEEP (friendly) ----------
+import os
+import pandas as pd
+
+st.subheader("Hit rate by coverage (HR@K)")
+
+if os.path.exists(HRK_SW):
+    sweep = pd.read_csv(HRK_SW)
+    # Rename columns for plain English
+    rename_map = {
+        "K_percent": "Coverage (%)",
+        "HitRate@K": "Hit rate",
+        "PAI@K": "PAI (× random)"
+    }
+    show_cols = [c for c in ["Coverage (%)","Hit rate","PAI (× random)"]
+                 if c in rename_map.values() or c in sweep.columns]
+    sweep_disp = sweep.rename(columns=rename_map)
+    st.dataframe(sweep_disp[show_cols], use_container_width=True)
+
+    st.caption(
+        "At **K% coverage**, **Hit rate** is the percent of incidents that fell **inside** the flagged area "
+        "on those days (higher is better).  "
+        "**PAI** shows improvement vs random selection: **PAI = Hit rate / (K/100)**."
+    )
+else:
+    st.info("HR@K sweep file not found. Add `metrics/hrk_sweep.csv` to show this table.")
+
