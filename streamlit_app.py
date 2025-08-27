@@ -708,16 +708,17 @@ st.subheader("Why here?")
 
 # Build options tied to session state (so map clicks update dropdown)
 # sectors for *this date & daypart* (for labeling only)
-# sectors for THIS date + daypart (for labeling only)
-sect_today = load_sectors_for_day(sel_date, sel_dp)
+# 1) sectors for THIS date + daypart (for labeling only)
+sect_today = load_sectors_for_day(sel_date, sel_dp)   # <-- no try/except here
 
-# friendly labels for today's Top-K hexes
+# 2) friendly labels for today's Top-K hexes
 options    = top["h3"].astype(str).tolist()
 labels_map = build_hex_dropdown_labels(options, top, grid, sect_today)
 
-# default to last clicked hex
+# 3) default to last clicked hex if present
 default_idx = options.index(st.session_state["sel_hex"]) if st.session_state.get("sel_hex") in options else 0
 
+# 4) human-friendly dropdown: "S1 • risk 0.873 • 618065…1039"
 sel_hex = st.selectbox(
     "Inspect grid cell (H3)",
     options=options,
@@ -727,8 +728,6 @@ sel_hex = st.selectbox(
 )
 st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
-
-
 
 
 
