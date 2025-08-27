@@ -453,102 +453,75 @@ except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
 
-# ---------- VIGILANCE BY DAYPART (month summary; tempered + recent blend) ----------
+# ---------- VIGILANCE BY DAYPART (month summary; based on sectors) ----------
 st.subheader("Vigilance by daypart (month summary)")
 
-# Total patrol time you want to split across the 4 time-of-day slots
 minutes_total = st.number_input(
     "Patrol minutes per day (across all times)",
     min_value=60, max_value=1440, value=480, step=30
 )
 
-# --- Build a month-wide feature frame aligned to the model ---
-Xm = Xmon.copy()
-
-# Clean time-of-day column 'dp'
-if "daypart" in Xm.columns:
-    Xm["dp"] = Xm["daypart"].astype(str)
+if not os.path.exists(SECT_CSV):
+    st.info("patrol_sectors.csv not found. Generate sectors for this month to enable this view.")
 else:
-    dp_cols = [c for c in Xm.columns if c.startswith("daypart_")]
-    Xm["dp"] = "unknown"
-    for c in dp_cols:
-        Xm.loc[Xm[c] == 1, "dp"] = c.replace("daypart_", "")
+    # Load month’s sectors and sum true deployment risk by daypart
+    sect_all = pd.read_csv(SECT_CSV, parse_dates=["date"])
+    sect_all["date"] = pd.to_datetime(sect_all["date"]).dt.normalize()
 
-# Score the month using the same risk mode as your map
-Xm_feat = Xm.copy()
-for c in feat_cols:
-    if c not in Xm_feat.columns:
-        Xm_feat[c] = 0.0
-Xm_feat = Xm_feat[feat_cols]
+    # Normalize daypart strings (guard against en-dash / whitespace)
+    def _norm_dp(x): return str(x).strip().replace("–", "-")
+    sect_all["daypart"] = sect_all["daypart"].map(_norm_dp)
 
-pro_month = clf_cal.predict_proba(Xm_feat)[:, 1]
-ri_month  = Xm["ri_norm"].fillna(0.0).to_numpy() if "ri_norm" in Xm.columns else np.zeros_like(pro_month)
-risk_month = pro_month if (risk_mode == "pro_only" or used_nowcast) else (0.6*pro_month + 0.4*ri_month)
+    month_mask = sect_all["date"].dt.to_period("M").astype(str) == sel_month
+    s_month = sect_all.loc[month_mask].copy()
 
-Xm["risk_m"] = risk_month
-Xm["date"]   = pd.to_datetime(Xm["date"]).dt.normalize()
+    if s_month.empty:
+        st.info("No sectors in this month.")
+    else:
+        # Month-total sector risk by time-of-day (no per-day normalization)
+        by_dp = (s_month.groupby("daypart", as_index=False)["risk_sum"]
+                          .sum()
+                          .rename(columns={"daypart": "Time of day", "risk_sum": "month_risk"}))
 
-# --- Month totals by time-of-day ---
-month_by_dp = (Xm.groupby("dp", as_index=False)["risk_m"]
-                 .sum()
-                 .rename(columns={"dp":"Time of day","risk_m":"month_risk"}))
+        # Keep only known dayparts, ordered nicely
+        order = ["00-06","06-12","12-18","18-24"]
+        by_dp["__ord"] = by_dp["Time of day"].map({k:i for i,k in enumerate(order)}).fillna(99).astype(int)
+        by_dp = by_dp.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
 
-# --- Recent (last N days) window to break ties & reflect recency ---
-N = 7
-dmax = Xm["date"].max()
-recent_mask = Xm["date"] >= (dmax - pd.Timedelta(days=N-1))
-recent_by_dp = (Xm.loc[recent_mask]
-                  .groupby("dp", as_index=False)["risk_m"]
-                  .sum()
-                  .rename(columns={"dp":"Time of day","risk_m":"recent_risk"}))
+        # If everything is zero (edge case), give equal score; else use real month totals
+        scores = by_dp["month_risk"].to_numpy(dtype=float)
+        if np.allclose(scores.sum(), 0.0):
+            scores = np.ones(len(by_dp), dtype=float)
 
-# Merge and keep only known dayparts
-dp = (month_by_dp.merge(recent_by_dp, on="Time of day", how="outer")
-                .fillna(0.0))
-dp = dp[dp["Time of day"] != "unknown"].copy()
+        # Allocate minutes with the same tempered policy as sectors
+        MIN_EACH  = 30    # every time-of-day gets at least this many minutes
+        MAX_SHARE = 0.50  # cap any one time-of-day at 50% of the total
+        ALPHA     = 0.7   # temper spiky distributions (0.5–0.8 flattens; 1.0 = proportional)
+        MIX_EQUAL = 0.30  # blend in equal split to further smooth (0–1)
 
-# --- Blend month and recent to get a robust score per time-of-day ---
-RECENT_WEIGHT = 0.35  # 35% recent, 65% month
-dp["score"] = (1-RECENT_WEIGHT)*dp["month_risk"] + RECENT_WEIGHT*dp["recent_risk"]
+        minutes_vec = allocate_dwell_minutes(
+            risks=scores,
+            total=int(minutes_total),
+            min_each=MIN_EACH,
+            max_share=MAX_SHARE,
+            alpha=ALPHA,
+            mix_equal=MIX_EQUAL,
+        )
 
-# If everything is zero (edge case), fall back to equal scores
-if dp["score"].sum() <= 0:
-    dp["score"] = 1.0
+        by_dp["Recommended minutes per day"] = minutes_vec
+        by_dp["Share of patrol time (%)"] = (100 * np.array(minutes_vec) / float(minutes_total)).round(1)
 
-# --- Allocate minutes using the tempered allocator (like sectors) ---
-# Tune here to get the style you want
-MIN_EACH   = 30    # minimum minutes each time-of-day gets
-MAX_SHARE  = 0.50  # any one time-of-day capped at 50% of the total
-ALPHA      = 0.7   # <1 flattens, >1 sharpens
-MIX_EQUAL  = 0.30  # mix-in equal split to smooth
+        # Friendly display
+        out = by_dp[["Time of day", "Share of patrol time (%)", "Recommended minutes per day"]]
+        st.dataframe(out, use_container_width=True)
+        st.bar_chart(out.set_index("Time of day")["Recommended minutes per day"], height=260)
 
-# Keep a consistent time-of-day order if you like
-order = ["00-06","06-12","12-18","18-24"]
-dp["__ord"] = dp["Time of day"].map({k:i for i,k in enumerate(order)}).fillna(99).astype(int)
-dp = dp.sort_values("__ord").drop(columns="__ord")
+        st.caption(
+            "Split is based on **month-total sector risk** (the risk you actually plan to cover), "
+            "tempered with the same **floor/cap** policy used for patrol sectors. "
+            f"Tuning: floor = {MIN_EACH} min, cap = {int(MAX_SHARE*100)}%, α = {ALPHA}, equal-mix = {int(MIX_EQUAL*100)}%."
+        )
 
-minutes_vec = allocate_dwell_minutes(
-    risks=dp["score"].values,
-    total=minutes_total,
-    min_each=MIN_EACH,
-    max_share=MAX_SHARE,
-    alpha=ALPHA,
-    mix_equal=MIX_EQUAL
-)
-dp["Recommended minutes per day"] = minutes_vec
-dp["Share of patrol time (%)"] = (100*np.array(minutes_vec)/minutes_total).round(1)
-
-# --- Friendly display ---
-out = dp[["Time of day","Share of patrol time (%)","Recommended minutes per day"]].reset_index(drop=True)
-st.dataframe(out, use_container_width=True)
-
-st.bar_chart(out.set_index("Time of day")["Recommended minutes per day"], height=260)
-st.caption(
-    "We estimate each time-of-day’s demand by blending **month-wide risk** with the **last 7 days**, "
-    "then split your daily patrol minutes with a **floor/cap** and **tempered weights** (like sectors). "
-    "Tune: floor(min each) = "
-    f"{MIN_EACH} min, cap = {int(MAX_SHARE*100)}%, α = {ALPHA}, equal-mix = {int(MIX_EQUAL*100)}%."
-)
 
 
 # ---------- SECTORS ----------
