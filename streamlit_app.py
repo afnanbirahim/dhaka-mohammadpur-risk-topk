@@ -7,6 +7,47 @@ from shapely.ops import unary_union
 from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is provided
 import numpy as np
 
+# Build friendly labels for the hex dropdown (e.g., "S1 • risk 0.873 • 618065…1039")
+def build_hex_dropdown_labels(hex_list, pred_df, grid_gdf, sect_today_gdf=None):
+    import pandas as pd
+    # risk & rank per hex (for the selected day/time already in pred_df)
+    df = pd.DataFrame({"h3": pd.Series(hex_list, dtype=str)})
+    r = pred_df.groupby("h3", as_index=False)["risk"].max()
+    r["h3"] = r["h3"].astype(str)
+    df = df.merge(r, on="h3", how="left").sort_values("risk", ascending=False).reset_index(drop=True)
+    df["rank"] = df.index + 1
+
+    # optional: sector membership by centroid-within
+    df["sector_rank"] = None
+    if sect_today_gdf is not None and not sect_today_gdf.empty:
+        sectors = sect_today_gdf.to_crs(4326)
+        gidx = grid_gdf.set_index("h3")["geometry"]
+        for i, row in df.iterrows():
+            try:
+                geom = gidx.loc[str(row["h3"])]
+            except KeyError:
+                continue
+            pt = geom.centroid
+            hit = sectors[sectors.contains(pt)]
+            if not hit.empty:
+                try:
+                    df.at[i, "sector_rank"] = int(hit.iloc[0].get("sector_rank"))
+                except Exception:
+                    df.at[i, "sector_rank"] = None
+
+    # label strings
+    def trunc(h):
+        h = str(h)
+        return h if len(h) <= 10 else f"{h[:6]}…{h[-4:]}"
+    def make_label(r):
+        s = f"S{int(r['sector_rank'])}" if pd.notna(r["sector_rank"]) else "—"
+        risk = f"{float(r['risk']):.3f}" if pd.notna(r["risk"]) else "n/a"
+        return f"{s} • risk {risk} • {trunc(r['h3'])}"
+
+    return {str(r["h3"]): make_label(r) for _, r in df.iterrows()}
+
+
+
 def allocate_dwell_minutes(
     risks,                 # 1D list/array of sector risk_sum
     total=360,             # total minutes available for this time-of-day
@@ -590,14 +631,40 @@ else:
 st.subheader("Why here?")
 
 # Build options tied to session state (so map clicks update dropdown)
-options = top["h3"].astype(str).tolist()
+# sectors for today/time (for labeling only; safe if file missing)
+sect_today = None
+if os.path.exists(SECT_GJ):
+    try:
+        sg = gpd.read_file(SECT_GJ).to_crs(4326)
+        mask = pd.Series(True, index=sg.index)
+        if "daypart" in sg.columns:
+            mask &= (sg["daypart"] == sel_dp)
+        if "date" in sg.columns:
+            mask &= (pd.to_datetime(sg["date"]).dt.normalize() == sel_date.normalize())
+        sect_today = sg.loc[mask].copy()
+    except Exception:
+        sect_today = None
+
+# friendly labels for the Top-K hexes shown today
+labels_map = build_hex_dropdown_labels(options, pred, grid, sect_today)
+
+# default to last clicked hex if exists
 if st.session_state.get("sel_hex") in options:
     default_idx = options.index(st.session_state["sel_hex"])
 else:
     default_idx = 0
-sel_hex = st.selectbox("Inspect grid cell (H3)", options=options, index=default_idx, key="sel_hex_widget")
+
+# 👉 human-friendly dropdown: "S1 • risk 0.873 • 618065…1039"
+sel_hex = st.selectbox(
+    "Inspect grid cell (H3)",
+    options=options,
+    index=default_idx,
+    format_func=lambda x: labels_map.get(str(x), str(x)),
+    key="sel_hex_widget"
+)
 st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
+
 
 # Friendly labels/formatters
 def friendly_label(col: str) -> str | None:
