@@ -17,6 +17,18 @@ if "sel_hex" not in st.session_state:
     st.session_state["sel_hex"] = None
 
 # ---------- SMALL HELPERS ----------
+def pretty_daypart(dp: str) -> str:
+    dp = str(dp).replace("–","-")
+    mapping = {
+        "00-06": "Night (00–06)",
+        "06-12": "Morning (06–12)",
+        "12-18": "Afternoon (12–18)",
+        "18-24": "Evening (18–24)",
+    }
+    return mapping.get(dp, dp)
+
+
+
 def union_all_safe(geom_series):
     try:
         return geom_series.union_all()
@@ -363,10 +375,28 @@ top_per_h3 = pred.groupby("h3", as_index=False)["risk"].max().sort_values("risk"
 k = max(1, int(len(top_per_h3) * TOPK / 100.0))
 top = top_per_h3.head(k)
 
-st.subheader(f"Top-{TOPK}% — {sel_date.date()} {sel_dp} (n={len(top)})")
-dl = top.copy(); dl.insert(0,"date",sel_date.date()); dl.insert(1,"daypart",sel_dp)
-st.download_button("Download Top-K hexes (CSV)", dl.to_csv(index=False).encode("utf-8"),
-                   file_name=f"topk_{sel_date.date()}_{sel_dp.replace(':','-')}.csv")
+TOTAL_CELLS = grid["h3"].nunique()
+n = int(len(top))
+dp_label = pretty_daypart(sel_dp)
+
+
+with st.expander("What does this mean?"):
+    st.markdown(
+        f"- We sort **all {TOTAL_CELLS} grid cells** by today’s risk for **{dp_label}** "
+        f"and keep only the **top {TOPK}%** → **{n}** cells.\n"
+        "- These cells are then merged into **patrol sectors** below with suggested minutes.\n"
+        "- Change the percentage if you want to cover a larger or smaller area."
+    )
+
+dl = top.copy()
+dl.insert(0,"date",sel_date.date())
+dl.insert(1,"daypart",sel_dp)
+st.download_button(
+    "Download Top-K hexes (CSV)",
+    data=dl.to_csv(index=False).encode("utf-8"),
+    file_name=f"topk_{sel_date.date()}_{sel_dp.replace(':','-')}.csv"
+)
+
 
 # ---------- MAP ----------
 use_folium = st.toggle("Use Folium map (fallback)", value=False)
@@ -728,6 +758,21 @@ if sel_hex:
             df_nice["__o"] = df_nice["Group"].map(order).fillna(9)
             df_nice = df_nice.sort_values(["__o","Feature"]).drop(columns="__o").reset_index(drop=True)
             st.dataframe(df_nice, use_container_width=True)
+    with st.expander("How to read this table"):
+    st.markdown("""
+**Feature** – the signal the model uses for this grid cell.  
+**Value** – this cell’s current value for that signal (rounded).  
+**Group** – which family the signal belongs to:
+
+- **Recent history**: short-term activity near here (incident flags 1/3/7/14/28 days ago,
+  “nearby incidents in last 7 days”, “recent 7-day activity”). Higher recent activity ⇒ **higher risk**.
+- **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).
+  More relevant places nearby ⇒ can **raise risk** (exposure/crowding).
+- **Distances**: how far to the nearest place/road (**“Distance to Primary road (m)”**).
+  Smaller distance ⇒ **closer context**, often **higher risk**.
+- **Other**: helpful flags like **“Same time last week (flag)”**.
+""")
+
 
     show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
     if show_shap and not row_X.empty:
