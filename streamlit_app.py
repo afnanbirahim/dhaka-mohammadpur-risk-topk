@@ -259,12 +259,14 @@ try:
             )
 
             # Tooltip shows exact H3 id + risk + rank
+
             tooltip = {
                 "html": "<b>H3:</b> {h3}<br/>"
-                        "<b>Risk:</b> {risk}<br/>"
-                        "<b>Rank:</b> {rank}",
+                        "<b>Risk score:</b> {risk}<br/>"
+                        "<b>Priority:</b> {rank}",
                 "style": {"backgroundColor": "rgba(0,0,0,0.7)", "color": "white"}
             }
+            
 
             st.pydeck_chart(
                 pdk.Deck(
@@ -289,16 +291,15 @@ try:
                     "weight": 1.5,
                     "fillOpacity": float(feat["properties"].get("risk_norm", 0))*0.7 + 0.3,
                 },
-                highlight_function=lambda feat: {"weight": 3, "color": "#000000"},
+                highlight_function=lambda feat: {"weight": 3, "color": "#000"},
                 tooltip=folium.GeoJsonTooltip(
                     fields=["h3", "risk", "rank"],
-                    aliases=["H3", "Risk", "Rank"],
-                    localize=True,
-                    sticky=True
+                    aliases=["H3", "Risk score", "Priority"],
+                    localize=True, sticky=True
                 ),
                 popup=folium.GeoJsonPopup(
                     fields=["h3", "risk", "rank"],
-                    aliases=["H3", "Risk", "Rank"],
+                    aliases=["H3", "Risk score", "Priority"],
                     localize=True
                 )
             ).add_to(m)
