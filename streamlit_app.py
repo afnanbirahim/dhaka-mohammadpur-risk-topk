@@ -760,17 +760,17 @@ if sel_hex:
             st.dataframe(df_nice, use_container_width=True)
     with st.expander("How to read this table"):
     st.markdown("""
-    **Feature** – the signal the model uses for this grid cell.  
-    **Value** – this cell’s current value for that signal (rounded).  
-    **Group** – which family the signal belongs to:
-    
-    - **Recent history**: short-term activity near here (incident flags 1/3/7/14/28 days ago,
-      “nearby incidents in last 7 days”, “recent 7-day activity”). Higher recent activity ⇒ **higher risk**.
-    - **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).
-      More relevant places nearby ⇒ can **raise risk** (exposure/crowding).
-    - **Distances**: how far to the nearest place/road (**“Distance to Primary road (m)”**).
-      Smaller distance ⇒ **closer context**, often **higher risk**.
-    - **Other**: helpful flags like **“Same time last week (flag)”**.
+            **Feature** – the signal the model uses for this grid cell.  
+            **Value** – this cell’s current value for that signal (rounded).  
+            **Group** – which family the signal belongs to:
+            
+            - **Recent history**: short-term activity near here (incident flags 1/3/7/14/28 days ago,
+              “nearby incidents in last 7 days”, “recent 7-day activity”). Higher recent activity ⇒ **higher risk**.
+            - **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).
+              More relevant places nearby ⇒ can **raise risk** (exposure/crowding).
+            - **Distances**: how far to the nearest place/road (**“Distance to Primary road (m)”**).
+              Smaller distance ⇒ **closer context**, often **higher risk**.
+            - **Other**: helpful flags like **“Same time last week (flag)”**.
 """)
 
 
