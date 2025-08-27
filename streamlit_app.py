@@ -8,21 +8,26 @@ from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is p
 import numpy as np
 
 # Build friendly labels for the hex dropdown (e.g., "S1 • risk 0.873 • 618065…1039")
-def build_hex_dropdown_labels(hex_list, pred_df, grid_gdf, sect_today_gdf=None):
-    import pandas as pd
-    # risk & rank per hex (for the selected day/time already in pred_df)
-    df = pd.DataFrame({"h3": pd.Series(hex_list, dtype=str)})
-    r = pred_df.groupby("h3", as_index=False)["risk"].max()
+def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=None):
+    """
+    hex_list: list[str] of H3 ids to show (usually the Top-K list)
+    df_with_risk: DataFrame with columns ["h3","risk"] at least (e.g., `top`)
+    grid_gdf: GeoDataFrame with columns ["h3","geometry"] (crs=4326)
+    sect_today_gdf: optional GeoDataFrame of sectors for the selected date/daypart
+    """
+    # risk for the options we are showing
+    d = pd.DataFrame({"h3": pd.Series(hex_list, dtype=str)})
+    r = df_with_risk[["h3","risk"]].copy()
     r["h3"] = r["h3"].astype(str)
-    df = df.merge(r, on="h3", how="left").sort_values("risk", ascending=False).reset_index(drop=True)
-    df["rank"] = df.index + 1
+    d = d.merge(r, on="h3", how="left").sort_values("risk", ascending=False).reset_index(drop=True)
+    d["rank"] = d.index + 1
 
-    # optional: sector membership by centroid-within
-    df["sector_rank"] = None
+    # optional: sector membership (centroid within polygon)
+    d["sector_rank"] = None
     if sect_today_gdf is not None and not sect_today_gdf.empty:
         sectors = sect_today_gdf.to_crs(4326)
         gidx = grid_gdf.set_index("h3")["geometry"]
-        for i, row in df.iterrows():
+        for i, row in d.iterrows():
             try:
                 geom = gidx.loc[str(row["h3"])]
             except KeyError:
@@ -31,12 +36,11 @@ def build_hex_dropdown_labels(hex_list, pred_df, grid_gdf, sect_today_gdf=None):
             hit = sectors[sectors.contains(pt)]
             if not hit.empty:
                 try:
-                    df.at[i, "sector_rank"] = int(hit.iloc[0].get("sector_rank"))
+                    d.at[i, "sector_rank"] = int(hit.iloc[0].get("sector_rank"))
                 except Exception:
-                    df.at[i, "sector_rank"] = None
+                    d.at[i, "sector_rank"] = None
 
-    # label strings
-    def trunc(h):
+    def trunc(h): 
         h = str(h)
         return h if len(h) <= 10 else f"{h[:6]}…{h[-4:]}"
     def make_label(r):
@@ -44,7 +48,7 @@ def build_hex_dropdown_labels(hex_list, pred_df, grid_gdf, sect_today_gdf=None):
         risk = f"{float(r['risk']):.3f}" if pd.notna(r["risk"]) else "n/a"
         return f"{s} • risk {risk} • {trunc(r['h3'])}"
 
-    return {str(r["h3"]): make_label(r) for _, r in df.iterrows()}
+    return {str(r["h3"]): make_label(r) for _, r in d.iterrows()}
 
 
 
@@ -646,7 +650,8 @@ if os.path.exists(SECT_GJ):
         sect_today = None
 
 # friendly labels for the Top-K hexes shown today
-labels_map = build_hex_dropdown_labels(options, pred, grid, sect_today)
+options = top["h3"].astype(str).tolist()
+labels_map = build_hex_dropdown_labels(options, top, grid, sect_today)
 
 # default to last clicked hex if exists
 if st.session_state.get("sel_hex") in options:
@@ -654,7 +659,7 @@ if st.session_state.get("sel_hex") in options:
 else:
     default_idx = 0
 
-# 👉 human-friendly dropdown: "S1 • risk 0.873 • 618065…1039"
+# human-friendly dropdown: "S1 • risk 0.873 • 618065…1039"
 sel_hex = st.selectbox(
     "Inspect grid cell (H3)",
     options=options,
@@ -662,8 +667,8 @@ sel_hex = st.selectbox(
     format_func=lambda x: labels_map.get(str(x), str(x)),
     key="sel_hex_widget"
 )
-st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
+
 
 
 # Friendly labels/formatters
