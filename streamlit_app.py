@@ -453,6 +453,88 @@ except Exception as e:
     st.warning(f"Map render failed: {e}")
     st.dataframe(top.head(20))
 
+# ---------- VIGILANCE BY DAYPART (month view; friendly) ----------
+st.subheader("Vigilance by daypart (month summary)")
+
+# Daily patrol budget across all times of day
+minutes_total = st.number_input(
+    "Patrol minutes per day (across all times)",
+    min_value=60, max_value=1440, value=480, step=30
+)
+
+# --- Build a month-wide feature frame aligned to the model ---
+Xm = Xmon.copy()
+
+# Derive a clean 'dp' column (time of day)
+if "daypart" in Xm.columns:
+    Xm["dp"] = Xm["daypart"].astype(str)
+else:
+    dp_cols = [c for c in Xm.columns if c.startswith("daypart_")]
+    if dp_cols:
+        Xm["dp"] = "unknown"
+        for c in dp_cols:
+            dp = c.replace("daypart_", "")
+            Xm.loc[Xm[c] == 1, "dp"] = dp
+    else:
+        Xm["dp"] = "unknown"
+
+# Align features: add missing model features as 0; drop extras
+for c in feat_cols:
+    if c not in Xm.columns:
+        Xm[c] = 0.0
+Xm_feat = Xm[feat_cols].copy()
+
+# Score the whole month using the same risk mode as the map
+with st.spinner("Estimating month-wide time-of-day demand…"):
+    pro_month = clf_cal.predict_proba(Xm_feat)[:, 1]
+    if "ri_norm" in Xm.columns:
+        ri_month = Xm["ri_norm"].fillna(0.0).to_numpy()
+    else:
+        ri_month = np.zeros_like(pro_month)
+
+    risk_month = pro_month if (risk_mode == "pro_only" or used_nowcast) else (0.6 * pro_month + 0.4 * ri_month)
+    Xm["risk_m"] = risk_month
+    Xm["date"] = pd.to_datetime(Xm["date"]).dt.normalize()
+
+# Sum risk across all cells for each date × daypart, then sum over the month
+risk_by_daypart = (Xm.groupby(["date", "dp"], as_index=False)["risk_m"]
+                     .sum()
+                     .rename(columns={"dp": "Time of day"}))
+
+month_totals = (risk_by_daypart.groupby("Time of day", as_index=False)["risk_m"]
+                .sum()
+                .rename(columns={"risk_m": "month_risk"}))
+
+# Filter out unknown rows if any
+month_totals = month_totals[month_totals["Time of day"] != "unknown"].copy()
+
+total_risk = float(month_totals["month_risk"].sum())
+if total_risk <= 0:
+    # fallback: even split
+    month_totals["Share of month’s risk (%)"] = 100.0 / max(1, len(month_totals))
+else:
+    month_totals["Share of month’s risk (%)"] = (100.0 * month_totals["month_risk"] / total_risk).round(1)
+
+# Suggested minutes per daypart, based on the share
+month_totals["Suggested minutes per day"] = (
+    (month_totals["Share of month’s risk (%)"] / 100.0) * minutes_total
+).round(0).astype(int)
+
+# Friendly display
+show_cols = ["Time of day", "Share of month’s risk (%)", "Suggested minutes per day"]
+disp = month_totals[show_cols].sort_values("Time of day").reset_index(drop=True)
+st.dataframe(disp, use_container_width=True)
+
+# Bar chart of suggested minutes
+st.bar_chart(disp.set_index("Time of day")["Suggested minutes per day"], height=260)
+st.caption(
+    "We estimate how much activity each time-of-day carries **this month** by summing "
+    "the model’s risk across all cells and days. The **Suggested minutes per day** split "
+    f"your total daily patrol time ({minutes_total} min) across times of day in proportion "
+    "to that load."
+)
+
+
 # ---------- SECTORS ----------
 st.subheader("Patrol sectors")
 if os.path.exists(SECT_CSV) and os.path.exists(SECT_GJ):
