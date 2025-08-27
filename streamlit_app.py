@@ -774,22 +774,22 @@ if sel_hex:
 
     with st.expander("How to read this table"):
     st.markdown("""
-**Feature** – the signal the model uses for this grid cell.  
-**Value** – this cell’s current value for that signal (rounded).  
-**Group** – which family the signal belongs to:
-
-- **Recent history**: short-term activity near here (e.g., incident flags `3/7/28` days ago, “nearby incidents in last 7 days”, “recent 7-day activity”).  
-  Higher recent activity ⇒ **higher risk**.
-
-- **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).  
-  More relevant places nearby ⇒ can **raise risk** (crowding, exposure).
-
-- **Distances**: how far to the nearest place (**“Distance to Primary road (m)”**, etc.).  
-  Smaller distance ⇒ **closer context**, often **higher risk**.
-
-- **Other**: helpful flags like **“Same time last week”**.
-""")
-
+    **Feature** – the signal the model uses for this grid cell.  
+    **Value** – this cell’s current value for that signal (rounded).  
+    **Group** – which family the signal belongs to:
+    
+    - **Recent history**: short-term activity near here (e.g., incident flags `3/7/28` days ago, “nearby incidents in last 7 days”, “recent 7-day activity”).  
+      Higher recent activity ⇒ **higher risk**.
+    
+    - **Counts**: how many places within a radius (e.g., **“Bus stops within 300 m (count)”**).  
+      More relevant places nearby ⇒ can **raise risk** (crowding, exposure).
+    
+    - **Distances**: how far to the nearest place (**“Distance to Primary road (m)”**, etc.).  
+      Smaller distance ⇒ **closer context**, often **higher risk**.
+    
+    - **Other**: helpful flags like **“Same time last week”**.
+    """)
+    
 
     # Optional: SHAP drivers (advanced)
     show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
