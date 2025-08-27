@@ -5,6 +5,65 @@ import numpy as np, pandas as pd, geopandas as gpd
 import streamlit as st, pydeck as pdk
 from shapely.ops import unary_union
 from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is provided
+import numpy as np
+
+def allocate_dwell_minutes(
+    risks,                 # list/array of sector risk_sum for this date+daypart
+    total=360,             # minutes available for this time-of-day
+    min_each=15,           # hard minimum minutes per sector
+    max_share=0.60,        # any one sector gets at most 60% of total
+    alpha=0.6,             # temper spiky risks (1.0=proportional; 0.5–0.7 flattens)
+    mix_equal=0.25         # blend some equal split (0–1) to smooth
+):
+    risks = np.asarray(risks, dtype=float)
+    n = len(risks)
+    if n == 0:
+        return []
+
+    # 1) hard floor
+    base = np.full(n, min_each, dtype=float)
+    remaining = total - base.sum()
+    if remaining <= 0:
+        x = np.full(n, total / n)
+    else:
+        # 2) tempered weights + a bit of equal split
+        if risks.sum() <= 0:
+            w = np.ones(n) / n
+        else:
+            w = risks ** alpha
+            w = w / w.sum()
+            w = mix_equal * (np.ones(n) / n) + (1 - mix_equal) * w
+            w = w / w.sum()
+
+        x = base + remaining * w
+
+        # 3) cap very large allocations and re-distribute overflow
+        cap = max_share * total
+        for _ in range(3):
+            over = x > cap
+            if not over.any():
+                break
+            overflow = (x[over] - cap).sum()
+            x[over] = cap
+            if overflow <= 1e-9:
+                break
+            can = ~over
+            if not can.any():
+                break
+            w2 = np.where(can, w, 0.0)
+            if w2.sum() == 0:
+                w2 = np.where(can, 1.0, 0.0)
+            w2 = w2 / w2.sum()
+            x[can] += overflow * w2
+
+    # 4) integer minutes (largest remainder) so sum == total
+    flo = np.floor(x).astype(int)
+    rem = int(total - flo.sum())
+    if rem > 0:
+        order = np.argsort(x - flo)[::-1]
+        flo[order[:rem]] += 1
+    return flo.tolist()
+
 
 # ---------- PAGE ----------
 st.set_page_config(page_title="Mohammadpur Spatial Risk", layout="wide")
@@ -428,6 +487,7 @@ if summary is not None and not summary.empty:
     st.caption(note)
 
 # ---------- SECTORS ----------
+# ---------- SECTORS ----------
 st.subheader("Patrol sectors")
 SECT_OK = os.path.exists(SECT_CSV) and os.path.exists(SECT_GJ)
 if SECT_OK:
@@ -440,19 +500,34 @@ if SECT_OK:
         s["Date"]     = pd.to_datetime(s["sector_id"].str.slice(0,8), format="%Y%m%d").dt.date
         s["Time"]     = s["sector_id"].str.extract(r"_(\d{2}-\d{2})_")[0]
         s["Label"]    = s.apply(lambda r: f"{r['Date']} {r['Time']} • S{r['Priority']}", axis=1)
+
         q50,q80,q95 = s["risk_sum"].quantile([0.50,0.80,0.95]).tolist()
         def band(v):
             if v <= q50: return "Low"
             if v <= q80: return "Medium"
             if v <= q95: return "High"
             return "Very high"
-        s["Risk level"]       = s["risk_sum"].apply(band)
-        s["Risk score"]       = s["risk_sum"].round(3)
-        s["Risk share %"]     = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
-        s["Cells"]            = s["n_hex"].astype(int)
-        s["Area (ha)"]        = s["area_ha"].round(1)
-        s["Suggested minutes"]= s["dwell_min"].astype(int)
-        s_disp = s.sort_values("Priority")[["Label","Priority","Risk level","Risk score","Risk share %","Cells","Area (ha)","Suggested minutes"]].rename(columns={"Label":"Sector"})
+        s["Risk level"]   = s["risk_sum"].apply(band)
+        s["Risk score"]   = s["risk_sum"].round(3)
+        s["Risk share %"] = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
+        s["Cells"]        = s["n_hex"].astype(int)
+        s["Area (ha)"]    = s["area_ha"].round(1)
+
+        # ✅ Recalculate "Suggested minutes" for display (tunable)
+        TOTAL = 6 * 60  # minutes for one time-of-day
+        s = s.sort_values("Priority").reset_index(drop=True)
+        s["Suggested minutes"] = allocate_dwell_minutes(
+            s["risk_sum"].values,
+            total=TOTAL,
+            min_each=15,   # floor per sector
+            max_share=0.60,# cap any one sector
+            alpha=0.6,     # temper spiky risk
+            mix_equal=0.25 # add some equal split
+        )
+
+        s_disp = s[["Label","Priority","Risk level","Risk score","Risk share %","Cells","Area (ha)","Suggested minutes"]].rename(columns={"Label":"Sector"})
+        ...
+
         def _color_risk(col):
             colors = {"Low":"#E3F2FD","Medium":"#FFF3E0","High":"#FFEBEE","Very high":"#FFCDD2"}
             return [f"background-color: {colors.get(v,'')}" for v in col]
