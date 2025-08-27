@@ -407,25 +407,48 @@ st.subheader("Patrol sectors")
 SECT_OK = os.path.exists(SECT_CSV) and os.path.exists(SECT_GJ)
 if SECT_OK:
     sect = pd.read_csv(SECT_CSV, parse_dates=["date"])
-    s = sect[(sect["date"] == sel_date) & (sect["daypart"] == sel_dp)].sort_values("sector_rank")
+    s = sect[(sect["date"] == sel_date) & (sect["daypart"] == sel_dp)].copy()
     if s.empty:
         st.info("No exported sectors for this day/daypart.")
     else:
-        # Friendly column names for display
-        display_map = {
-            "sector_id": "Sector",
-            "n_hex": "Cells",
-            "risk_sum": "Sector risk",
-            "area_ha": "Area (ha)",
-            "dwell_min": "Suggested minutes",
-            "sector_rank": "Priority",
-        }
-        show_cols = [c for c in display_map.keys() if c in s.columns]
-        s_disp = s[show_cols].rename(columns=display_map)
+        # Parse sector_id: YYYYMMDD_DAYPART_Sk  -> Priority = k
+        # (We already have sector_rank, but this makes the label nicer)
+        s["Priority"] = s["sector_rank"].astype(int)
+        s["Date"]     = pd.to_datetime(s["sector_id"].str.slice(0, 8), format="%Y%m%d").dt.date
+        s["Time"]     = s["sector_id"].str.extract(r"_(\d{2}-\d{2})_")[0]
+        s["Label"]    = s.apply(lambda r: f"{r['Date']} {r['Time']} • S{r['Priority']}", axis=1)
 
-        st.dataframe(s_disp, use_container_width=True)
+        # Risk level bands for *this day & daypart* (relative, simple & clear)
+        # 0–50% = Low, 50–80% = Medium, 80–95% = High, 95–100% = Very high
+        q50, q80, q95 = s["risk_sum"].quantile([0.50, 0.80, 0.95]).tolist()
+        def band(v):
+            if v <= q50: return "Low"
+            if v <= q80: return "Medium"
+            if v <= q95: return "High"
+            return "Very high"
+        s["Risk level"]    = s["risk_sum"].apply(band)
+        s["Risk score"]    = s["risk_sum"].round(3)                 # friendlier name
+        s["Risk share %"]  = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
+        s["Cells"]         = s["n_hex"].astype(int)
+        s["Area (ha)"]     = s["area_ha"].round(1)
+        s["Suggested minutes"] = s["dwell_min"].astype(int)
 
-        # Offer both downloads: friendly (for briefings) and raw (for analysts)
+        # Display columns (friendly order)
+        s_disp = s.sort_values("Priority")[
+            ["Label", "Priority", "Risk level", "Risk score", "Risk share %",
+             "Cells", "Area (ha)", "Suggested minutes"]
+        ].rename(columns={"Label": "Sector"})
+
+        # Optional: light styling for Risk level
+        def _color_risk(col):
+            colors = {"Low":"#E3F2FD","Medium":"#FFF3E0","High":"#FFEBEE","Very high":"#FFCDD2"}
+            return [f"background-color: {colors.get(v,'')}" for v in col]
+        try:
+            st.dataframe(s_disp.style.apply(_color_risk, subset=["Risk level"]), use_container_width=True)
+        except Exception:
+            st.dataframe(s_disp, use_container_width=True)
+
+        # Downloads: friendly + raw
         st.download_button(
             "Download sectors (friendly CSV)",
             data=s_disp.to_csv(index=False).encode("utf-8"),
@@ -440,119 +463,97 @@ else:
     st.info("ops/patrol_sectors.* not found (optional).")
 
 
+
 # ---------- WHY HERE ----------
 st.subheader("Why here?")
 
-import re
-import numpy as np
+import re, numpy as np
 
-# Helper: map raw feature names to friendly labels
+# Friendly labels
 def friendly_label(col: str) -> str | None:
     if col == "ri_norm": return "Recent activity score (0–1)"
     if col == "neighbor_lag7d": return "Nearby incidents in last 7 days (avg)"
     if col == "same_daypart_last_week": return "Same time last week (flag)"
     if col == "days_since_last": return "Days since last incident"
     if col == "neighbor_dsl_min": return "Days since last in nearby cells (min)"
-
     m = re.match(r"^dist_(.+)_m$", col)
     if m:
-        base = m.group(1).replace("_", " ").title()
-        base = (base
-                .replace("Busstops", "Bus stops")
-                .replace("Roads Primary", "Primary road")
-                .replace("Roads Secondary", "Secondary road"))
+        base = m.group(1).replace("_"," ").title().replace("Busstops","Bus stops").replace("Roads Primary","Primary road").replace("Roads Secondary","Secondary road")
         return f"Distance to {base} (m)"
-
     m = re.match(r"^cnt_(.+)_(\d+)m$", col)
     if m:
-        what, radius = m.groups()
-        base = what.replace("_", " ").title().replace("Busstops", "Bus stops")
-        return f"{base} within {radius} m (count)"
-
+        what, r = m.groups()
+        base = what.replace("_"," ").title().replace("Busstops","Bus stops")
+        return f"{base} within {r} m (count)"
     m = re.match(r"^lag(\d+)d$", col)
     if m: return f"Incident {m.group(1)} days ago (flag)"
-
     m = re.match(r"^past(\d+)_sum$", col)
     if m: return f"Incidents in past {m.group(1)} days (sum)"
     m = re.match(r"^past(\d+)_exp$", col)
     if m: return f"Recent {m.group(1)}-day activity (weighted)"
+    return None
 
-    return None  # hide unknown/internal
-
-# Helper: format values
 def fmt_value(col: str, val):
-    try:
-        x = float(val)
-    except Exception:
-        return val
-    if col.startswith("dist_") or col.startswith("cnt_") or col.startswith("days_since"):
+    try: x = float(val)
+    except: return val
+    if col.startswith(("dist_","cnt_","days_since")) or re.match(r"^lag\d+d$", col):
         return int(round(x))
-    if re.match(r"^lag\d+d$", col) or col in {"same_daypart_last_week"}:
-        return int(round(x))
-    if col in {"ri_norm"} or col.startswith("past") or col == "neighbor_lag7d":
+    if col in {"same_daypart_last_week"}: return int(round(x))
+    if col in {"ri_norm"} or col.startswith("past") or col=="neighbor_lag7d":
         return round(x, 3)
     return round(x, 3)
 
-# Selected hex
 sel_hex = st.selectbox("Inspect hex (H3)", options=top["h3"].tolist() if len(top) else [])
 st.caption(f"Selected H3: {sel_hex}")
 
 if sel_hex:
-    # risk & rank for this hex today (from 'pred' built earlier)
-    risk_series = pred.loc[pred["h3"].astype(str) == sel_hex, "risk"]
-    risk_here = float(risk_series.max()) if not risk_series.empty else np.nan
-    # rank among today's hexes (1 = highest)
-    ranking = (pred.copy()
-                 .assign(_h3=pred["h3"].astype(str))
-                 .sort_values("risk", ascending=False)
-                 .reset_index(drop=True))
-    ranking["rank"] = ranking.index + 1
-    rank_here = int(ranking.loc[ranking["_h3"] == sel_hex, "rank"].min()) if (ranking["_h3"] == sel_hex).any() else None
+    # Risk & priority of this hex (today)
+    today = pred.copy()
+    today["_h3"] = today["h3"].astype(str)
+    risk_here = float(today.loc[today["_h3"]==sel_hex, "risk"].max()) if (today["_h3"]==sel_hex).any() else np.nan
+    today = today.sort_values("risk", ascending=False).reset_index(drop=True)
+    today["rank"] = today.index + 1
+    if (today["_h3"]==sel_hex).any():
+        rank_here = int(today.loc[today["_h3"]==sel_hex, "rank"].min())
+        pct = 100.0 * (1.0 - (rank_here / len(today)))
+        # four-band by percentile
+        band = ("Very high" if pct >= 95 else
+                "High" if pct >= 80 else
+                "Medium" if pct >= 50 else
+                "Low")
+        st.markdown(f"**Risk score:** {risk_here:.3f}  |  **Priority:** {rank_here}  |  **Level:** {band} (top {pct:.1f}%)")
+    else:
+        st.markdown("Risk score: n/a")
 
-    # show a short summary line
-    badge = f"Risk score: **{risk_here:.3f}**" if not np.isnan(risk_here) else "Risk score: n/a"
-    if rank_here is not None:
-        badge += f"  |  Priority: **{rank_here}**"
-    st.markdown(badge)
-
-    # row of features for this hex
+    # Friendly feature table
     row_X = Xsel.loc[rep["h3"].astype(str) == sel_hex]
     if row_X.empty:
         st.info("No feature row for that hex.")
     else:
-        # clean up columns we don't want to show
         drop_like = [c for c in row_X.columns if c.endswith("_x") or c.endswith("_y") or c.startswith("daypart_")]
         row = row_X.drop(columns=drop_like, errors="ignore").iloc[0]
-
-        # build friendly table
         items = []
         for col, val in row.items():
-            if col in {"date", "h3"}:
-                continue
-            label = friendly_label(col)
-            if not label:
-                continue
-            items.append({"Feature": label, "Value": fmt_value(col, val)})
+            if col in {"date","h3"}: continue
+            lab = friendly_label(col)
+            if not lab: continue
+            items.append({"Feature": lab, "Value": fmt_value(col, val)})
 
-        import pandas as pd
-        if not items:
-            st.info("No interpretable features to display.")
-        else:
-            # group for readability
-            def _group(name: str):
+        if items:
+            df_nice = pd.DataFrame(items)
+            # group & order
+            def _grp(name):
                 if "Distance" in name: return "Distances"
                 if "within" in name:   return "Counts"
-                if "Recent" in name or "last" in name or "lag" in name: return "Recent history"
+                if "Recent" in name or "last" in name or "flag" in name: return "Recent history"
                 return "Other"
-
-            df_nice = pd.DataFrame(items)
-            df_nice["Group"] = df_nice["Feature"].map(_group)
-            # order groups: history → counts → distances → other
-            grp_order = {"Recent history": 0, "Counts": 1, "Distances": 2, "Other": 3}
-            df_nice["__ord"] = df_nice["Group"].map(grp_order).fillna(9)
-            df_nice = df_nice.sort_values(["__ord","Feature"]).drop(columns="__ord").reset_index(drop=True)
-
+            df_nice["Group"] = df_nice["Feature"].map(_grp)
+            order = {"Recent history":0, "Counts":1, "Distances":2, "Other":3}
+            df_nice["__o"] = df_nice["Group"].map(order).fillna(9)
+            df_nice = df_nice.sort_values(["__o","Feature"]).drop(columns="__o").reset_index(drop=True)
             st.dataframe(df_nice, use_container_width=True)
+        else:
+            st.info("No interpretable features to display.")
 
         # Optional: SHAP drivers
         show_shap = st.checkbox("Compute SHAP drivers (slower)", value=False)
@@ -561,29 +562,26 @@ if sel_hex:
                 import shap
                 model_for_shap = None
                 if os.path.exists(MODEL_RAW):
-                    with open(MODEL_RAW, "rb") as f:
-                        model_for_shap = pickle.load(f)
+                    with open(MODEL_RAW, "rb") as f: model_for_shap = pickle.load(f)
                 if model_for_shap is None:
                     model_for_shap = getattr(clf_cal, "base_estimator", None) or getattr(clf_cal, "estimator", None)
 
                 sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
-                if isinstance(sv, list):  # LightGBM binary returns [class0, class1]
-                    sv = sv[1]
+                if isinstance(sv, list): sv = sv[1]
                 contrib = pd.Series(sv[0], index=row_X.columns)
-                contrib = contrib.drop(index=drop_like, errors="ignore")  # same drops as above
-                # map to friendly names & keep top 10 by |impact|
+                contrib = contrib.drop(index=drop_like, errors="ignore")
                 top = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s: -np.abs(s)).head(10)
                 if not top.empty:
-                    df_shap = pd.DataFrame({
+                    st.write("Top feature contributions (SHAP): positive ↑ increases risk; negative ↓ reduces risk.")
+                    st.dataframe(pd.DataFrame({
                         "Feature": [friendly_label(c) for c in top.index],
-                        "SHAP": [round(float(v), 4) for v in top.values]
-                    })
-                    st.write("Top feature contributions (SHAP):")
-                    st.dataframe(df_shap, use_container_width=True)
+                        "Impact (SHAP)": [round(float(v), 4) for v in top.values]
+                    }), use_container_width=True)
                 else:
                     st.info("SHAP computed, but no interpretable features to show.")
             except Exception as e:
                 st.info(f"SHAP not available ({e}).")
+
 
 
 # ---------- REPORTS ----------
