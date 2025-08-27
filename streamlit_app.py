@@ -87,16 +87,16 @@ def allocate_dwell_minutes(
 
 def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=None):
     """
-    Return {h3: 'S# • risk 0.873 • 618065…1039'} for a list of hexes.
-    df_with_risk must have ['h3','risk'].
+    Return {h3: 'S# • risk 0.873 • 618065…1039'} for the Top-K list.
+    df_with_risk must have ['h3','risk'] for the current date/daypart.
     """
     d = pd.DataFrame({"h3": pd.Series(hex_list, dtype=str)})
     r = df_with_risk[["h3","risk"]].copy()
     r["h3"] = r["h3"].astype(str)
     d = d.merge(r, on="h3", how="left").sort_values("risk", ascending=False).reset_index(drop=True)
     d["rank"] = d.index + 1
-
     d["sector_rank"] = None
+
     if sect_today_gdf is not None and not sect_today_gdf.empty:
         sectors = sect_today_gdf.to_crs(4326)
         gidx = grid_gdf.set_index("h3")["geometry"]
@@ -104,17 +104,18 @@ def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=N
             h = str(row["h3"])
             if h not in gidx.index:
                 continue
-            pt = gidx.loc[h].representative_point()
-            hit = sectors[sectors.intersects(pt)]
+            hex_poly = gidx.loc[h]
+            hit = sectors[sectors.geometry.intersects(hex_poly)]
             if not hit.empty:
+                # pick the highest-priority sector if multiple
+                sec_rank = hit["sector_rank"].astype("Int64").min()
                 try:
-                    d.at[i, "sector_rank"] = int(hit.iloc[0].get("sector_rank"))
+                    d.at[i, "sector_rank"] = int(sec_rank)
                 except Exception:
                     d.at[i, "sector_rank"] = None
 
     def trunc(h):
-        h = str(h)
-        return h if len(h) <= 10 else f"{h[:6]}…{h[-4:]}"
+        h = str(h);  return h if len(h) <= 10 else f"{h[:6]}…{h[-4:]}"
     def make_label(r):
         s = f"S{int(r['sector_rank'])}" if pd.notna(r["sector_rank"]) else "—"
         risk = f"{float(r['risk']):.3f}" if pd.notna(r["risk"]) else "n/a"
@@ -125,7 +126,7 @@ def build_hex_dropdown_labels(hex_list, df_with_risk, grid_gdf, sect_today_gdf=N
 def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFrame:
     """
     Return ONLY the patrol-sector polygons for the given date + daypart,
-    with columns: sector_id, sector_rank, daypart, date, geometry (crs=4326).
+    columns: sector_id, sector_rank, daypart, date, geometry (crs=4326).
     Joins polygons (SECT_GJ) with attributes (SECT_CSV).
     """
     empty = gpd.GeoDataFrame(
@@ -139,7 +140,7 @@ def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFram
     if not (os.path.exists(SECT_GJ) and os.path.exists(SECT_CSV)):
         return empty
 
-    # polygons
+    # Polygons
     try:
         g = gpd.read_file(SECT_GJ).to_crs(4326)
     except Exception:
@@ -149,43 +150,39 @@ def load_sectors_for_day(sel_date: pd.Timestamp, sel_dp: str) -> gpd.GeoDataFram
             g = g.rename(columns={"id": "sector_id"})
         else:
             return empty
+    g["sector_id"] = g["sector_id"].astype(str)
 
-    # attributes (the CSV has date/daypart)
+    # Attributes
     try:
         a = pd.read_csv(SECT_CSV, parse_dates=["date"])
     except Exception:
         return empty
+    a["sector_id"] = a["sector_id"].astype(str)
     a["date"] = pd.to_datetime(a["date"], errors="coerce").dt.normalize()
+    # normalize daypart (strip, hyphenize any en dash)
+    def _norm_dp(x): 
+        return str(x).strip().replace("–","-")
+    a["daypart"] = a["daypart"].map(_norm_dp)
 
     day = pd.to_datetime(sel_date).normalize()
-    a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp)][
-        ["sector_id", "sector_rank", "daypart", "date"]
-    ].copy()
+    sel_dp_norm = _norm_dp(sel_dp)
+    a_today = a[(a["date"] == day) & (a["daypart"] == sel_dp_norm)]
     if a_today.empty:
         return empty
 
-    # join polygons ↔ attributes for this day+time
-    gj = g.merge(a_today, on="sector_id", how="inner")
+    gj = g.merge(a_today[["sector_id","sector_rank","daypart","date"]], on="sector_id", how="inner")
     if gj.empty:
         return empty
 
-    # normalize date column just in case
-    if "date" in gj.columns:
-        gj["date"] = pd.to_datetime(gj["date"], errors="coerce").dt.normalize()
-
-    # ---- SAFE BOOLEAN MASK (aligned to gj.index) ----
-    m = np.ones(len(gj), dtype=bool)
-    if "daypart" in gj.columns:
-        m &= (gj["daypart"].astype(str).values == str(sel_dp))
-    if "date" in gj.columns:
-        m &= (pd.to_datetime(gj["date"], errors="coerce").dt.normalize().values
-              == day.to_datetime64())
-
-    gj = gj.loc[m]
+    # normalize & final filter
+    gj["date"] = pd.to_datetime(gj["date"], errors="coerce").dt.normalize()
+    gj["daypart"] = gj["daypart"].map(_norm_dp)
+    mask = (gj["date"] == day) & (gj["daypart"] == sel_dp_norm)
+    gj = gj.loc[mask]
     if gj.empty:
         return empty
 
-    keep = ["sector_id", "sector_rank", "daypart", "date", "geometry"]
+    keep = ["sector_id","sector_rank","daypart","date","geometry"]
     for c in keep:
         if c not in gj.columns:
             gj[c] = pd.NA
@@ -501,14 +498,26 @@ else:
 st.subheader("Why here?")
 
 # sectors (for dropdown labels only) for THIS date & time
+# sectors for THIS date + time (for labeling only)
 sect_today = load_sectors_for_day(sel_date, sel_dp)
+
+# build friendly labels for Top-K hexes today
 options    = top["h3"].astype(str).tolist()
 labels_map = build_hex_dropdown_labels(options, top, grid, sect_today)
+
+# default to last clicked hex if present
 default_idx = options.index(st.session_state["sel_hex"]) if st.session_state.get("sel_hex") in options else 0
-sel_hex = st.selectbox("Inspect grid cell (H3)", options=options, index=default_idx,
-                       format_func=lambda x: labels_map.get(str(x), str(x)), key="sel_hex_widget")
+
+sel_hex = st.selectbox(
+    "Inspect grid cell (H3)",
+    options=options,
+    index=default_idx,
+    format_func=lambda x: labels_map.get(str(x), str(x)),
+    key="sel_hex_widget"
+)
 st.session_state["sel_hex"] = sel_hex
 st.caption(f"Selected H3: {sel_hex}")
+
 
 def friendly_label(col: str) -> str | None:
     if col == "ri_norm": return "Recent activity score (0–1)"
