@@ -759,7 +759,10 @@ if sel_hex:
             df_nice = df_nice.sort_values(["__o","Feature"]).drop(columns="__o").reset_index(drop=True)
             st.dataframe(df_nice, use_container_width=True)
     with st.expander("How to read this table"):
-    st.markdown("""
+# (this line should already be in your code)
+st.dataframe(df_nice, use_container_width=True)
+
+HELP_MD = """
 **Feature** – the signal the model uses for this grid cell.  
 **Value** – this cell’s current value for that signal (rounded).  
 **Group** – which family the signal belongs to:
@@ -771,7 +774,10 @@ if sel_hex:
 - **Distances**: how far to the nearest place/road (**“Distance to Primary road (m)”**).
   Smaller distance ⇒ **closer context**, often **higher risk**.
 - **Other**: helpful flags like **“Same time last week (flag)”**.
-""")
+"""
+
+with st.expander("How to read this table"):
+    st.markdown(HELP_MD)
 
 
 
