@@ -8,23 +8,27 @@ from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is p
 import numpy as np
 
 def allocate_dwell_minutes(
-    risks,                 # list/array of sector risk_sum for this date+daypart
-    total=360,             # minutes available for this time-of-day
+    risks,                 # 1D list/array of sector risk_sum
+    total=360,             # total minutes available for this time-of-day
     min_each=15,           # hard minimum minutes per sector
-    max_share=0.60,        # any one sector gets at most 60% of total
+    max_share=0.60,        # at most 60% of 'total' can go to any one sector
     alpha=0.6,             # temper spiky risks (1.0=proportional; 0.5–0.7 flattens)
-    mix_equal=0.25         # blend some equal split (0–1) to smooth
+    mix_equal=0.25         # blend some equal split (0–1) to smooth further
 ):
+    """Return integer minutes per sector (sum == total)."""
     risks = np.asarray(risks, dtype=float)
     n = len(risks)
+    total = int(total)
     if n == 0:
         return []
 
-    # 1) hard floor
-    base = np.full(n, min_each, dtype=float)
+    # 1) start with hard floor
+    base = np.full(n, float(min_each))
     remaining = total - base.sum()
+
     if remaining <= 0:
-        x = np.full(n, total / n)
+        # not enough time even for floor: split the total evenly
+        x = np.full(n, total / n, dtype=float)
     else:
         # 2) tempered weights + a bit of equal split
         if risks.sum() <= 0:
@@ -33,36 +37,53 @@ def allocate_dwell_minutes(
             w = risks ** alpha
             w = w / w.sum()
             w = mix_equal * (np.ones(n) / n) + (1 - mix_equal) * w
-            w = w / w.sum()
+            sw = w.sum()
+            if sw <= 0:
+                w = np.ones(n) / n
+            else:
+                w = w / sw
 
         x = base + remaining * w
 
-        # 3) cap very large allocations and re-distribute overflow
-        cap = max_share * total
-        for _ in range(3):
+        # 3) cap large allocations and re-distribute overflow safely
+        cap = float(max_share * total)
+        for _ in range(5):  # a few passes in case capping creates new overflow
             over = x > cap
             if not over.any():
                 break
-            overflow = (x[over] - cap).sum()
+            overflow_sum = float((x[over] - cap).sum())
             x[over] = cap
-            if overflow <= 1e-9:
-                break
-            can = ~over
-            if not can.any():
-                break
-            w2 = np.where(can, w, 0.0)
-            if w2.sum() == 0:
-                w2 = np.where(can, 1.0, 0.0)
-            w2 = w2 / w2.sum()
-            x[can] += overflow * w2
 
-    # 4) integer minutes (largest remainder) so sum == total
+            can = ~over
+            if not can.any() or overflow_sum <= 1e-9:
+                break
+
+            # weights for receivers only
+            w2 = w.copy()
+            w2[over] = 0.0
+            s2 = w2.sum()
+            if s2 <= 0:
+                w2 = can.astype(float)
+                s2 = w2.sum()
+
+            # add overflow back (vectorized, no shape mismatch)
+            x += overflow_sum * (w2 / s2)
+
+    # 4) make integers (largest remainder) and keep sum == total
+    x = np.maximum(x, 0.0)
     flo = np.floor(x).astype(int)
-    rem = int(total - flo.sum())
-    if rem > 0:
+    diff = int(total - flo.sum())
+    if diff > 0:
         order = np.argsort(x - flo)[::-1]
-        flo[order[:rem]] += 1
+        flo[order[:diff]] += 1
+    elif diff < 0:
+        # very rare; trim minutes from largest allocations
+        order = np.argsort(flo)[::-1]
+        for i in range(-diff):
+            flo[order[i % n]] -= 1
+
     return flo.tolist()
+
 
 
 # ---------- PAGE ----------
@@ -487,8 +508,8 @@ if summary is not None and not summary.empty:
     st.caption(note)
 
 # ---------- SECTORS ----------
-# ---------- SECTORS ----------
 st.subheader("Patrol sectors")
+
 SECT_OK = os.path.exists(SECT_CSV) and os.path.exists(SECT_GJ)
 if SECT_OK:
     sect = pd.read_csv(SECT_CSV, parse_dates=["date"])
@@ -496,37 +517,41 @@ if SECT_OK:
     if s.empty:
         st.info("No exported sectors for this day/time.")
     else:
+        # Friendlier labels/derived fields
         s["Priority"] = s["sector_rank"].astype(int)
         s["Date"]     = pd.to_datetime(s["sector_id"].str.slice(0,8), format="%Y%m%d").dt.date
         s["Time"]     = s["sector_id"].str.extract(r"_(\d{2}-\d{2})_")[0]
         s["Label"]    = s.apply(lambda r: f"{r['Date']} {r['Time']} • S{r['Priority']}", axis=1)
 
-        q50,q80,q95 = s["risk_sum"].quantile([0.50,0.80,0.95]).tolist()
+        # Risk level bands relative to this day/time
+        q50, q80, q95 = s["risk_sum"].quantile([0.50, 0.80, 0.95]).tolist()
         def band(v):
             if v <= q50: return "Low"
             if v <= q80: return "Medium"
             if v <= q95: return "High"
             return "Very high"
-        s["Risk level"]   = s["risk_sum"].apply(band)
-        s["Risk score"]   = s["risk_sum"].round(3)
-        s["Risk share %"] = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
-        s["Cells"]        = s["n_hex"].astype(int)
-        s["Area (ha)"]    = s["area_ha"].round(1)
+        s["Risk level"]       = s["risk_sum"].apply(band)
+        s["Risk score"]       = s["risk_sum"].round(3)
+        s["Risk share %"]     = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
+        s["Cells"]            = s["n_hex"].astype(int)
+        s["Area (ha)"]        = s["area_ha"].round(1)
 
-        # ✅ Recalculate "Suggested minutes" for display (tunable)
-        TOTAL = 6 * 60  # minutes for one time-of-day
+        # ✅ Recalculate "Suggested minutes" for display using the allocator
+        TOTAL_MIN = 6 * 60  # minutes per time-of-day (tune if needed)
         s = s.sort_values("Priority").reset_index(drop=True)
         s["Suggested minutes"] = allocate_dwell_minutes(
             s["risk_sum"].values,
-            total=TOTAL,
-            min_each=15,   # floor per sector
-            max_share=0.60,# cap any one sector
-            alpha=0.6,     # temper spiky risk
-            mix_equal=0.25 # add some equal split
+            total=TOTAL_MIN,
+            min_each=15,    # floor per sector
+            max_share=0.60, # cap any one sector
+            alpha=0.6,      # temper spiky risk
+            mix_equal=0.25  # add some equal split
         )
 
-        s_disp = s[["Label","Priority","Risk level","Risk score","Risk share %","Cells","Area (ha)","Suggested minutes"]].rename(columns={"Label":"Sector"})
-        ...
+        # Display table
+        s_disp = s[[
+            "Label","Priority","Risk level","Risk score","Risk share %","Cells","Area (ha)","Suggested minutes"
+        ]].rename(columns={"Label":"Sector"})
 
         def _color_risk(col):
             colors = {"Low":"#E3F2FD","Medium":"#FFF3E0","High":"#FFEBEE","Very high":"#FFCDD2"}
@@ -536,6 +561,7 @@ if SECT_OK:
         except Exception:
             st.dataframe(s_disp, use_container_width=True)
 
+        # Small glossary right under the table
         with st.expander("What do these terms mean?"):
             st.markdown("""
 - **Grid cell (H3):** a small hexagon tile (~200 m) covering the map.  
@@ -545,14 +571,20 @@ if SECT_OK:
 - **Suggested minutes:** recommended time to spend in that area for this time-of-day.
 """)
 
-        st.download_button("Download sectors (friendly CSV)",
+        # Downloads: friendly + raw
+        st.download_button(
+            "Download sectors (friendly CSV)",
             data=s_disp.to_csv(index=False).encode("utf-8"),
-            file_name=f"patrol_sectors_{sel_date.date()}_{sel_dp.replace(':','-')}_friendly.csv")
-        st.download_button("Download sectors (raw CSV)",
-            data=open(SECT_CSV,"rb").read(),
-            file_name="patrol_sectors_raw.csv")
+            file_name=f"patrol_sectors_{sel_date.date()}_{sel_dp.replace(':','-')}_friendly.csv",
+        )
+        st.download_button(
+            "Download sectors (raw CSV)",
+            data=open(SECT_CSV, "rb").read(),
+            file_name="patrol_sectors_raw.csv",
+        )
 else:
     st.info("ops/patrol_sectors.* not found (optional).")
+
 
 # ---------- WHY HERE ----------
 st.subheader("Why here?")
