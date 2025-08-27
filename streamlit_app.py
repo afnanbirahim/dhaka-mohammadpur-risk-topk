@@ -443,6 +443,7 @@ else:
 st.subheader("Why here?")
 show_shap = st.checkbox("Compute SHAP (slower)", value=False)
 sel_hex = st.selectbox("Inspect hex (H3)", options=top["h3"].tolist() if len(top) else [])
+st.caption(f"Selected H3: {sel_hex}")  # shows the exact H3 id you’re inspecting
 if sel_hex:
     row_X = Xsel.loc[rep["h3"].astype(str) == sel_hex]
     if row_X.empty:
