@@ -5,6 +5,40 @@ import numpy as np, pandas as pd, geopandas as gpd
 import streamlit as st, pydeck as pdk
 from shapely.ops import unary_union
 from app_utils import ensure_bundle  # downloads & extracts when BUNDLE_URL is provided
+# --- Hex → Sector lookup (uses ops/patrol_sectors.geojson) ---
+def find_sector_for_hex(sel_hex: str, sel_date: pd.Timestamp, sel_dp: str):
+    if not (os.path.exists(SECT_GJ) and sel_hex and sel_dp):
+        return None
+    try:
+        sg = gpd.read_file(SECT_GJ).to_crs(4326)
+    except Exception:
+        return None
+
+    # normalize types
+    if "date" in sg.columns:
+        with pd.option_context("future.no_silent_downcasting", True):
+            try: sg["date"] = pd.to_datetime(sg["date"]).dt.normalize()
+            except: pass
+
+    # filter to the selected day
+    mask = (sg.get("daypart") == sel_dp)
+    if "date" in sg.columns:
+        mask &= (sg["date"] == pd.to_datetime(sel_date).normalize())
+    today_sectors = sg.loc[mask].copy()
+    if today_sectors.empty:
+        return None
+
+    # hex geometry
+    try:
+        hex_geom = grid.loc[grid["h3"].astype(str) == sel_hex, "geometry"].iloc[0]
+    except Exception:
+        return None
+
+    hit = today_sectors.loc[today_sectors.intersects(hex_geom)]
+    if hit.empty:
+        return None
+    return hit.iloc[0]  # GeoSeries row with sector_id, geometry, etc.
+
 
 # Quiet SHAP noise
 logging.getLogger("shap").setLevel(logging.ERROR)
@@ -419,7 +453,6 @@ if summary is not None:
     _plot_bar(summary["recommended_min_per_day"], "Recommended patrol minutes per day by daypart")
     st.caption(source_note + ". Use this to apportion daily patrol time across dayparts.")
 
-
 # ---------- SECTORS ----------
 st.subheader("Patrol sectors")
 
@@ -430,35 +463,31 @@ if SECT_OK:
     if s.empty:
         st.info("No exported sectors for this day/daypart.")
     else:
-        # Parse sector_id: YYYYMMDD_DAYPART_Sk  -> Priority = k
-        # (We already have sector_rank, but this makes the label nicer)
+        # Friendlier labels/derived fields
         s["Priority"] = s["sector_rank"].astype(int)
         s["Date"]     = pd.to_datetime(s["sector_id"].str.slice(0, 8), format="%Y%m%d").dt.date
         s["Time"]     = s["sector_id"].str.extract(r"_(\d{2}-\d{2})_")[0]
         s["Label"]    = s.apply(lambda r: f"{r['Date']} {r['Time']} • S{r['Priority']}", axis=1)
 
-        # Risk level bands for *this day & daypart* (relative, simple & clear)
-        # 0–50% = Low, 50–80% = Medium, 80–95% = High, 95–100% = Very high
+        # Risk level bands relative to this day/time
         q50, q80, q95 = s["risk_sum"].quantile([0.50, 0.80, 0.95]).tolist()
         def band(v):
             if v <= q50: return "Low"
             if v <= q80: return "Medium"
             if v <= q95: return "High"
             return "Very high"
-        s["Risk level"]    = s["risk_sum"].apply(band)
-        s["Risk score"]    = s["risk_sum"].round(3)                 # friendlier name
-        s["Risk share %"]  = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
-        s["Cells"]         = s["n_hex"].astype(int)
-        s["Area (ha)"]     = s["area_ha"].round(1)
-        s["Suggested minutes"] = s["dwell_min"].astype(int)
+        s["Risk level"]       = s["risk_sum"].apply(band)
+        s["Risk score"]       = s["risk_sum"].round(3)
+        s["Risk share %"]     = (100 * s["risk_sum"] / s["risk_sum"].sum()).round(1)
+        s["Cells"]            = s["n_hex"].astype(int)
+        s["Area (ha)"]        = s["area_ha"].round(1)
+        s["Suggested minutes"]= s["dwell_min"].astype(int)
 
-        # Display columns (friendly order)
+        # Display table
         s_disp = s.sort_values("Priority")[
-            ["Label", "Priority", "Risk level", "Risk score", "Risk share %",
-             "Cells", "Area (ha)", "Suggested minutes"]
-        ].rename(columns={"Label": "Sector"})
+            ["Label","Priority","Risk level","Risk score","Risk share %","Cells","Area (ha)","Suggested minutes"]
+        ].rename(columns={"Label":"Sector"})
 
-        # Optional: light styling for Risk level
         def _color_risk(col):
             colors = {"Low":"#E3F2FD","Medium":"#FFF3E0","High":"#FFEBEE","Very high":"#FFCDD2"}
             return [f"background-color: {colors.get(v,'')}" for v in col]
@@ -466,6 +495,16 @@ if SECT_OK:
             st.dataframe(s_disp.style.apply(_color_risk, subset=["Risk level"]), use_container_width=True)
         except Exception:
             st.dataframe(s_disp, use_container_width=True)
+
+        # 👉 Glossary (add here)
+        with st.expander("What do these terms mean?"):
+            st.markdown("""
+- **Grid cell (H3)**: a small hexagon tile (~200 m) covering the map.
+- **Cell risk score**: how risky this cell is today for the selected time-of-day.
+- **Patrol sector**: a group of adjacent flagged cells merged into one patrol area.
+- **Priority**: rank of a sector among today’s sectors (1 = most urgent).
+- **Suggested minutes**: recommended time to spend inside a sector for this time-of-day.
+""")
 
         # Downloads: friendly + raw
         st.download_button(
@@ -483,12 +522,12 @@ else:
 
 
 
+
 # ---------- WHY HERE ----------
 st.subheader("Why here?")
 
 import re, numpy as np
 
-# Friendly labels
 def friendly_label(col: str) -> str | None:
     if col == "ri_norm": return "Recent activity score (0–1)"
     if col == "neighbor_lag7d": return "Nearby incidents in last 7 days (avg)"
@@ -522,11 +561,11 @@ def fmt_value(col: str, val):
         return round(x, 3)
     return round(x, 3)
 
-sel_hex = st.selectbox("Inspect hex (H3)", options=top["h3"].tolist() if len(top) else [])
+sel_hex = st.selectbox("Inspect grid cell (H3)", options=top["h3"].tolist() if len(top) else [])
 st.caption(f"Selected H3: {sel_hex}")
 
 if sel_hex:
-    # Risk & priority of this hex (today)
+    # risk & priority of this hex for the current daypart/date
     today = pred.copy()
     today["_h3"] = today["h3"].astype(str)
     risk_here = float(today.loc[today["_h3"]==sel_hex, "risk"].max()) if (today["_h3"]==sel_hex).any() else np.nan
@@ -535,19 +574,39 @@ if sel_hex:
     if (today["_h3"]==sel_hex).any():
         rank_here = int(today.loc[today["_h3"]==sel_hex, "rank"].min())
         pct = 100.0 * (1.0 - (rank_here / len(today)))
-        # four-band by percentile
-        band = ("Very high" if pct >= 95 else
-                "High" if pct >= 80 else
-                "Medium" if pct >= 50 else
-                "Low")
+        band = ("Very high" if pct >= 95 else "High" if pct >= 80 else "Medium" if pct >= 50 else "Low")
         st.markdown(f"**Risk score:** {risk_here:.3f}  |  **Priority:** {rank_here}  |  **Level:** {band} (top {pct:.1f}%)")
     else:
         st.markdown("Risk score: n/a")
 
-    # Friendly feature table
+    # Show which sector this hex belongs to (if ops/geojson available)
+    sector_row = find_sector_for_hex(sel_hex, sel_date, sel_dp)
+    if sector_row is not None:
+        sector_id = str(sector_row.get("sector_id"))
+        # pull attributes from CSV
+        if os.path.exists(SECT_CSV):
+            s_all = pd.read_csv(SECT_CSV, parse_dates=["date"])
+            s_one = s_all[(s_all["date"]==sel_date) & (s_all["daypart"]==sel_dp) & (s_all["sector_id"]==sector_id)]
+            if not s_one.empty:
+                info = s_one.iloc[0]
+                st.info(
+                    f"This cell is in **Sector S{int(info['sector_rank'])}** "
+                    f"(Priority {int(info['sector_rank'])}) — "
+                    f"**Suggested minutes:** {int(info['dwell_min'])}, "
+                    f"**Cells:** {int(info['n_hex'])}, "
+                    f"**Area:** {round(float(info['area_ha']),1)} ha."
+                )
+            else:
+                st.info(f"This cell is in **{sector_id}**.")
+        else:
+            st.info(f"This cell is in **{sector_id}**.")
+    else:
+        st.info("This cell is not in today’s Top-K selection for this time-of-day.")
+
+    # Friendly feature table for this hex
     row_X = Xsel.loc[rep["h3"].astype(str) == sel_hex]
     if row_X.empty:
-        st.info("No feature row for that hex.")
+        st.info("No feature row for that cell.")
     else:
         drop_like = [c for c in row_X.columns if c.endswith("_x") or c.endswith("_y") or c.startswith("daypart_")]
         row = row_X.drop(columns=drop_like, errors="ignore").iloc[0]
@@ -560,7 +619,6 @@ if sel_hex:
 
         if items:
             df_nice = pd.DataFrame(items)
-            # group & order
             def _grp(name):
                 if "Distance" in name: return "Distances"
                 if "within" in name:   return "Counts"
@@ -574,32 +632,33 @@ if sel_hex:
         else:
             st.info("No interpretable features to display.")
 
-        # Optional: SHAP drivers
-        show_shap = st.checkbox("Compute SHAP drivers (slower)", value=False)
-        if show_shap:
-            try:
-                import shap
-                model_for_shap = None
-                if os.path.exists(MODEL_RAW):
-                    with open(MODEL_RAW, "rb") as f: model_for_shap = pickle.load(f)
-                if model_for_shap is None:
-                    model_for_shap = getattr(clf_cal, "base_estimator", None) or getattr(clf_cal, "estimator", None)
+    # Optional: SHAP drivers (advanced)
+    show_shap = st.checkbox("Show top drivers (SHAP — slower)", value=False)
+    if show_shap and not row_X.empty:
+        try:
+            import shap
+            model_for_shap = None
+            if os.path.exists(MODEL_RAW):
+                with open(MODEL_RAW, "rb") as f: model_for_shap = pickle.load(f)
+            if model_for_shap is None:
+                model_for_shap = getattr(clf_cal,"base_estimator",None) or getattr(clf_cal,"estimator",None)
 
-                sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
-                if isinstance(sv, list): sv = sv[1]
-                contrib = pd.Series(sv[0], index=row_X.columns)
-                contrib = contrib.drop(index=drop_like, errors="ignore")
-                top = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s: -np.abs(s)).head(10)
-                if not top.empty:
-                    st.write("Top feature contributions (SHAP): positive ↑ increases risk; negative ↓ reduces risk.")
-                    st.dataframe(pd.DataFrame({
-                        "Feature": [friendly_label(c) for c in top.index],
-                        "Impact (SHAP)": [round(float(v), 4) for v in top.values]
-                    }), use_container_width=True)
-                else:
-                    st.info("SHAP computed, but no interpretable features to show.")
-            except Exception as e:
-                st.info(f"SHAP not available ({e}).")
+            sv = shap.TreeExplainer(model_for_shap).shap_values(row_X)
+            if isinstance(sv, list): sv = sv[1]
+            contrib = pd.Series(sv[0], index=row_X.columns)
+            contrib = contrib.drop(index=drop_like, errors="ignore")
+            top = contrib.reindex([c for c in contrib.index if friendly_label(c)]).sort_values(key=lambda s: -np.abs(s)).head(10)
+            if not top.empty:
+                st.write("Top drivers: positive values ↑ increase risk; negative values ↓ reduce risk.")
+                st.dataframe(pd.DataFrame({
+                    "Feature": [friendly_label(c) for c in top.index],
+                    "Impact": [round(float(v), 4) for v in top.values]
+                }), use_container_width=True)
+            else:
+                st.info("No interpretable drivers to show.")
+        except Exception as e:
+            st.info(f"SHAP not available ({e}).")
+
 
 
 
